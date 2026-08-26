@@ -29,6 +29,12 @@ class CalendarHelperTests(unittest.TestCase):
 
 
 class SyncCycleTests(unittest.TestCase):
+    def test_day_fourteen_remains_in_the_first_cycle(self):
+        cycle = resolve_sync_cycle(date(2026, 9, 14))
+
+        self.assertEqual(cycle.node_date, date(2026, 9, 1))
+        self.assertEqual(cycle.kind, "first")
+
     def test_september_first_node_uses_august_actuals_and_midmonth_returns(self):
         cycle = resolve_sync_cycle(date(2026, 9, 8))
 
