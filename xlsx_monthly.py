@@ -799,6 +799,7 @@ def apply_monthly_values(
     aliases: dict[str, str],
     critical_skus: set[str],
     matcher: Callable[[Any, Any, list[dict[str, Any]], dict[str, str]], Any],
+    after_return_rows: list[dict[str, Any]] | None = None,
 ) -> MonthlyWriteResult:
     insertion = insert_month_column(sheet_xml, shared_strings, cycle)
     layout = insertion.layout
@@ -855,6 +856,16 @@ def apply_monthly_values(
         before_return_match = matcher(
             sheet_sku, sheet_name, before_return_rows, normalized_aliases
         )
+        after_return_match = (
+            matcher(
+                sheet_sku,
+                sheet_name,
+                after_return_rows,
+                normalized_aliases,
+            )
+            if after_return_rows is not None
+            else before_return_match
+        )
         overall_return_match = matcher(
             sheet_sku, sheet_name, overall_return_rows, normalized_aliases
         )
@@ -873,9 +884,11 @@ def apply_monthly_values(
         changed: list[str] = []
         actual_status = actual_match.status
         before_return_status = before_return_match.status
+        after_return_status = after_return_match.status
         return_status = overall_return_match.status
         actual_auto_write = False
         before_return_match_ok = False
+        after_return_match_ok = False
         return_match_ok = False
 
         if (
@@ -989,14 +1002,29 @@ def apply_monthly_values(
                 return_percentage_style,
             )
         )
-        row = _clear_cell_value(
-            row,
-            layout.after_return_col,
-            row_number,
-            style=return_percentage_style,
-        )
-        if old_after_return:
-            changed.append("after_return")
+        if after_return_rows is None:
+            row = _clear_cell_value(
+                row,
+                layout.after_return_col,
+                row_number,
+                style=return_percentage_style,
+            )
+            if old_after_return:
+                changed.append("after_return")
+        else:
+            (
+                row,
+                new_after_return,
+                after_return_status,
+                after_return_match_ok,
+            ) = update_return_rate(
+                after_return_match,
+                "calculatedAfterShipmentReturnRate",
+                layout.after_return_col,
+                "after_return",
+                old_after_return,
+                return_percentage_style,
+            )
         row, new_return, return_status, return_match_ok = update_return_rate(
             overall_return_match,
             "calculatedOverallReturnRate",
@@ -1039,6 +1067,14 @@ def apply_monthly_values(
             "before_return_candidate_title": _candidate_value(
                 before_return_match, "title"
             ),
+            "after_return_status": after_return_status,
+            "after_return_match_ok": after_return_match_ok,
+            "after_return_candidate_sku": _candidate_value(
+                after_return_match, "itemOuterId"
+            ),
+            "after_return_candidate_title": _candidate_value(
+                after_return_match, "title"
+            ),
             "return_status": return_status,
             "return_match_ok": return_match_ok,
             "return_candidate_sku": _candidate_value(
@@ -1077,6 +1113,9 @@ def apply_monthly_values(
             "before_return_status": (
                 selected["before_return_status"] if selected else "missing"
             ),
+            "after_return_status": (
+                selected["after_return_status"] if selected else "missing"
+            ),
             "actual_candidate_sku": selected["actual_candidate_sku"] if selected else "",
             "actual_candidate_title": selected["actual_candidate_title"] if selected else "",
             "before_return_candidate_sku": (
@@ -1085,12 +1124,22 @@ def apply_monthly_values(
             "before_return_candidate_title": (
                 selected["before_return_candidate_title"] if selected else ""
             ),
+            "after_return_candidate_sku": (
+                selected["after_return_candidate_sku"] if selected else ""
+            ),
+            "after_return_candidate_title": (
+                selected["after_return_candidate_title"] if selected else ""
+            ),
             "return_candidate_sku": selected["return_candidate_sku"] if selected else "",
             "return_candidate_title": selected["return_candidate_title"] if selected else "",
             "passed": bool(
                 selected
                 and selected["actual_auto_write"]
                 and selected["before_return_match_ok"]
+                and (
+                    after_return_rows is None
+                    or selected["after_return_match_ok"]
+                )
                 and selected["return_match_ok"]
             ),
         })

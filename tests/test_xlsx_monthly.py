@@ -25,6 +25,7 @@ from xlsx_monthly import (
     update_workbook_xml,
 )
 from erp_excel_sync import (
+    AFTER_RETURN_FIELD,
     BEFORE_RETURN_FIELD,
     MatchResult,
     OVERALL_RETURN_FIELD,
@@ -846,6 +847,7 @@ class MonthlyValueWriteTests(unittest.TestCase):
             aliases=kwargs.get("aliases", {}),
             critical_skus=kwargs.get("critical_skus", set()),
             matcher=choose_candidate,
+            after_return_rows=kwargs.get("after_return_rows"),
         )
 
     def test_uses_independent_datasets_and_never_leaks_unused_conflicting_fields(self):
@@ -905,6 +907,35 @@ class MonthlyValueWriteTests(unittest.TestCase):
         self.assertEqual(result.rows[0]["before_return_status"], "exact")
         self.assertEqual(result.rows[0]["return_status"], "below_threshold")
         self.assertTrue(result.critical_results[0]["passed"])
+
+    def test_after_shipment_rate_uses_its_own_dataset_and_threshold(self):
+        cycle = resolve_sync_cycle(date(2026, 8, 15))
+        after_rows = [{
+            "itemOuterId": "A-1",
+            "title": "Alpha",
+            "itemCount": 50,
+            AFTER_RETURN_FIELD: "30.00%",
+        }, {
+            "itemOuterId": "B-2",
+            "title": "Beta",
+            "itemCount": 49,
+            AFTER_RETURN_FIELD: None,
+        }]
+
+        result = self._apply(
+            self._sheet(),
+            cycle,
+            [],
+            [],
+            after_return_rows=after_rows,
+        )
+
+        self.assertIn(b'<c r="AB2" s="219"><v>0.3</v></c>', result.sheet_xml)
+        self.assertIn(b'<c r="AB3" s="220"/>', result.sheet_xml)
+        self.assertEqual(result.rows[0]["after_return_status"], "exact")
+        self.assertEqual(result.rows[0]["new_after_return"], "0.3")
+        self.assertEqual(result.rows[1]["after_return_status"], "below_threshold")
+        self.assertEqual(result.rows[1]["new_after_return"], "")
 
     def test_before_and_after_columns_copy_overall_percentage_style(self):
         sheet = self._sheet().replace(

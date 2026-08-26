@@ -148,6 +148,17 @@ class DateWindowTests(unittest.TestCase):
         self.assertEqual(payload["asTypes"], "5,1,2,7,8,10")
         self.assertNotIn("4", payload["asTypes"].split(","))
 
+    def test_builds_after_shipment_payload_without_unshipped_or_exchange(self):
+        payload = build_payload(
+            "2026-08-01",
+            "2026-08-31",
+            as_types=("1", "2", "7", "8", "10"),
+        )
+
+        self.assertEqual(payload["asTypes"], "1,2,7,8,10")
+        self.assertNotIn("5", payload["asTypes"].split(","))
+        self.assertNotIn("4", payload["asTypes"].split(","))
+
 
 class MonthlyOrchestrationTests(unittest.TestCase):
     def _args(self, root: Path) -> SimpleNamespace:
@@ -161,6 +172,7 @@ class MonthlyOrchestrationTests(unittest.TestCase):
             report_dir=root / "reports",
             actual_json=None,
             before_return_json=None,
+            after_return_json=None,
             return_json=None,
             company_id="111873",
             cookie_env="ERP_COOKIE",
@@ -185,6 +197,7 @@ class MonthlyOrchestrationTests(unittest.TestCase):
                 {"data": {"list": [{"itemOuterId": "A"}]}},
                 {"data": {"list": [{"itemOuterId": "B"}]}},
                 {"data": {"list": [{"itemOuterId": "C"}]}},
+                {"data": {"list": [{"itemOuterId": "D"}]}},
             ]
             prepare_mock.return_value = SimpleNamespace(
                 inserted=True,
@@ -207,6 +220,10 @@ class MonthlyOrchestrationTests(unittest.TestCase):
                 [
                     (("2026-09-01", "2026-09-14"), ()),
                     (("2026-08-01", "2026-08-31"), ("5",)),
+                    (
+                        ("2026-08-01", "2026-08-31"),
+                        ("1", "2", "7", "8", "10"),
+                    ),
                     (
                         ("2026-08-01", "2026-08-31"),
                         ("5", "1", "2", "7", "8", "10"),
@@ -232,11 +249,14 @@ class MonthlyOrchestrationTests(unittest.TestCase):
             actual = root / "actual.json"
             returns = root / "return.json"
             before_returns = root / "before-return.json"
+            after_returns = root / "after-return.json"
             actual.write_text('{"data":{"list":[]}}', encoding="utf-8")
             returns.write_text('{"data":{"list":[]}}', encoding="utf-8")
             before_returns.write_text('{"data":{"list":[]}}', encoding="utf-8")
+            after_returns.write_text('{"data":{"list":[]}}', encoding="utf-8")
             args.actual_json = actual
             args.before_return_json = before_returns
+            args.after_return_json = after_returns
             args.return_json = returns
             prepare_mock.return_value = SimpleNamespace(
                 inserted=False,

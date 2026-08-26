@@ -92,7 +92,10 @@ BEFORE_RETURN_PROFILE = ReturnRateProfile(
     "before_shipment", "发货前退货率", ("5",), BEFORE_RETURN_FIELD
 )
 AFTER_RETURN_PROFILE = ReturnRateProfile(
-    "after_shipment", "发货后退货率", (), AFTER_RETURN_FIELD, False
+    "after_shipment",
+    "发货后退货率",
+    ("1", "2", "7", "8", "10"),
+    AFTER_RETURN_FIELD,
 )
 OVERALL_RETURN_PROFILE = ReturnRateProfile(
     "overall",
@@ -1067,6 +1070,7 @@ def prepare_monthly_update(
     overall_return_rows: list[dict[str, Any]],
     aliases: dict[str, str],
     critical_skus: set[str] | None,
+    after_return_rows: list[dict[str, Any]] | None = None,
 ) -> PreparedMonthlyUpdate:
     with zipfile.ZipFile(workbook, "r") as archive:
         names = archive.namelist()
@@ -1086,6 +1090,7 @@ def prepare_monthly_update(
             aliases,
             critical_skus or set(),
             choose_candidate,
+            after_return_rows=after_return_rows,
         )
 
         replacements: dict[str, bytes] = {WORKSHEET_PATH: result.sheet_xml}
@@ -1169,6 +1174,11 @@ def _monthly_report_rows(
             "row", "sheet_sku", "sheet_name", "before_return_status",
             "old_before_return", "new_before_return",
         )
+    elif field == "after_return":
+        keys = (
+            "row", "sheet_sku", "sheet_name", "after_return_status",
+            "old_after_return", "new_after_return",
+        )
     else:
         keys = ("row", "sheet_sku", "sheet_name", "return_status", "old_return", "new_return")
     return [{key: row.get(key) for key in keys} for row in rows]
@@ -1183,12 +1193,19 @@ def run_monthly_sync(args: argparse.Namespace, run_date: date | None = None) -> 
     if not workbook.exists():
         raise SystemExit(f"Master workbook not found: {workbook}")
     before_return_json = getattr(args, "before_return_json", None)
-    offline_inputs = (args.actual_json, before_return_json, args.return_json)
+    after_return_json = getattr(args, "after_return_json", None)
+    offline_inputs = (
+        args.actual_json,
+        before_return_json,
+        after_return_json,
+        args.return_json,
+    )
     if any(path is not None for path in offline_inputs) and not all(
         path is not None for path in offline_inputs
     ):
         raise SystemExit(
-            "Offline mode requires --actual-json, --before-return-json and --return-json"
+            "Offline mode requires --actual-json, --before-return-json, "
+            "--after-return-json and --return-json"
         )
     browser_login = bool(getattr(args, "browser_login", False)) and sys.platform == "darwin"
 
@@ -1205,6 +1222,7 @@ def run_monthly_sync(args: argparse.Namespace, run_date: date | None = None) -> 
     if args.actual_json is not None:
         actual_document = load_json(args.actual_json)
         before_return_document = load_json(before_return_json)
+        after_return_document = load_json(after_return_json)
         overall_return_document = load_json(args.return_json)
     elif browser_login:
         print("正在打开ERP专用Chrome登录窗口……", flush=True)
@@ -1223,6 +1241,13 @@ def run_monthly_sync(args: argparse.Namespace, run_date: date | None = None) -> 
                 return_end,
                 as_types=BEFORE_RETURN_PROFILE.as_types,
             )
+            after_return_document = fetch_api_via_chrome(
+                browser_session,
+                args.company_id,
+                return_start,
+                return_end,
+                as_types=AFTER_RETURN_PROFILE.as_types,
+            )
             overall_return_document = fetch_api_via_chrome(
                 browser_session,
                 args.company_id,
@@ -1239,6 +1264,10 @@ def run_monthly_sync(args: argparse.Namespace, run_date: date | None = None) -> 
             None, cookie, args.company_id, return_start, return_end,
             as_types=BEFORE_RETURN_PROFILE.as_types,
         )
+        after_return_document = _load_or_fetch_window(
+            None, cookie, args.company_id, return_start, return_end,
+            as_types=AFTER_RETURN_PROFILE.as_types,
+        )
         overall_return_document = _load_or_fetch_window(
             None, cookie, args.company_id, return_start, return_end,
             as_types=OVERALL_RETURN_PROFILE.as_types,
@@ -1250,6 +1279,9 @@ def run_monthly_sync(args: argparse.Namespace, run_date: date | None = None) -> 
     before_return_snapshot = (
         snapshot_dir / f"return_before_{return_start}_{return_end}.json"
     )
+    after_return_snapshot = (
+        snapshot_dir / f"return_after_{return_start}_{return_end}.json"
+    )
     overall_return_snapshot = (
         snapshot_dir / f"return_overall_{return_start}_{return_end}.json"
     )
@@ -1257,18 +1289,26 @@ def run_monthly_sync(args: argparse.Namespace, run_date: date | None = None) -> 
     previous_before_return = _previous_snapshot(
         snapshot_dir, "return_before", before_return_snapshot
     )
+    previous_after_return = _previous_snapshot(
+        snapshot_dir, "return_after", after_return_snapshot
+    )
     previous_overall_return = _previous_snapshot(
         snapshot_dir, "return_overall", overall_return_snapshot
     )
     save_json(actual_snapshot, actual_document)
     save_json(before_return_snapshot, before_return_document)
+    save_json(after_return_snapshot, after_return_document)
     save_json(overall_return_snapshot, overall_return_document)
 
     actual_rows = api_rows(actual_document)
     before_return_rows = api_rows(before_return_document)
+    after_return_rows = api_rows(after_return_document)
     overall_return_rows = api_rows(overall_return_document)
     calculated_before_rates = populate_calculated_return_rate(
         before_return_rows, BEFORE_RETURN_FIELD
+    )
+    calculated_after_rates = populate_calculated_return_rate(
+        after_return_rows, AFTER_RETURN_FIELD
     )
     calculated_overall_rates = populate_calculated_return_rate(
         overall_return_rows, OVERALL_RETURN_FIELD
@@ -1283,6 +1323,7 @@ def run_monthly_sync(args: argparse.Namespace, run_date: date | None = None) -> 
         overall_return_rows,
         aliases,
         critical_skus,
+        after_return_rows=after_return_rows,
     )
 
     report_dir = Path(args.report_dir) / cycle.node_date.isoformat()
@@ -1291,12 +1332,21 @@ def run_monthly_sync(args: argparse.Namespace, run_date: date | None = None) -> 
         "row", "sheet_sku", "sheet_name", "before_return_status",
         "old_before_return", "new_before_return",
     ]
+    after_return_fields = [
+        "row", "sheet_sku", "sheet_name", "after_return_status",
+        "old_after_return", "new_after_return",
+    ]
     return_fields = ["row", "sheet_sku", "sheet_name", "return_status", "old_return", "new_return"]
     write_csv(report_dir / "actual_changes.csv", _monthly_report_rows(prepared.rows, "actual"), actual_fields)
     write_csv(
         report_dir / "before_return_changes.csv",
         _monthly_report_rows(prepared.rows, "before_return"),
         before_return_fields,
+    )
+    write_csv(
+        report_dir / "after_return_changes.csv",
+        _monthly_report_rows(prepared.rows, "after_return"),
+        after_return_fields,
     )
     write_csv(
         report_dir / "overall_return_changes.csv",
@@ -1313,8 +1363,10 @@ def run_monthly_sync(args: argparse.Namespace, run_date: date | None = None) -> 
         list(prepared.critical_results),
         [
             "sku", "sheet_exists", "actual_status", "before_return_status",
-            "return_status", "actual_candidate_sku", "actual_candidate_title",
+            "after_return_status", "return_status", "actual_candidate_sku",
+            "actual_candidate_title",
             "before_return_candidate_sku", "before_return_candidate_title",
+            "after_return_candidate_sku", "after_return_candidate_title",
             "return_candidate_sku", "return_candidate_title", "passed",
         ],
     )
@@ -1328,6 +1380,12 @@ def run_monthly_sync(args: argparse.Namespace, run_date: date | None = None) -> 
         )
         if previous_before_return is not None else []
     )
+    after_return_differences = (
+        compare_api_snapshots(
+            api_rows(previous_after_return), after_return_rows
+        )
+        if previous_after_return is not None else []
+    )
     overall_return_differences = (
         compare_api_snapshots(
             api_rows(previous_overall_return), overall_return_rows
@@ -1339,6 +1397,11 @@ def run_monthly_sync(args: argparse.Namespace, run_date: date | None = None) -> 
     write_csv(
         report_dir / "api_before_return_changes.csv",
         flatten_api_differences(before_return_differences),
+        difference_fields,
+    )
+    write_csv(
+        report_dir / "api_after_return_changes.csv",
+        flatten_api_differences(after_return_differences),
         difference_fields,
     )
     write_csv(
@@ -1382,14 +1445,11 @@ def run_monthly_sync(args: argparse.Namespace, run_date: date | None = None) -> 
                 before_return_rows,
                 calculated_before_rates,
             ),
-            "after_shipment": {
-                "enabled": False,
-                "asTypes": [],
-                "apiCount": 0,
-                "calculatedCount": 0,
-                "belowThresholdCount": 0,
-                "blankOrInvalidCount": 0,
-            },
+            "after_shipment": profile_summary(
+                AFTER_RETURN_PROFILE,
+                after_return_rows,
+                calculated_after_rates,
+            ),
             "overall": profile_summary(
                 OVERALL_RETURN_PROFILE,
                 overall_return_rows,
@@ -1441,6 +1501,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Offline ERP response for the before-shipment return-rate window",
     )
     parser.add_argument(
+        "--after-return-json",
+        type=Path,
+        help="Offline ERP response for the after-shipment return-rate window",
+    )
+    parser.add_argument(
         "--return-json",
         type=Path,
         help="Offline ERP response for the overall return-rate window",
@@ -1476,11 +1541,11 @@ RUN_DEFAULTS: dict[str, Any] = {
 }
 CONFIG_PATH_FIELDS = {
     "workbook", "snapshot_dir", "actual_json", "before_return_json",
-    "return_json", "aliases", "skus_file", "report_dir",
+    "after_return_json", "return_json", "aliases", "skus_file", "report_dir",
 }
 CONFIG_FIELDS = {
     "workbook", "snapshot_dir", "actual_json", "before_return_json",
-    "return_json", "company_id", "cookie_env",
+    "after_return_json", "return_json", "company_id", "cookie_env",
     "browser_login", "aliases", "skus_file", "report_dir", "dry_run",
 }
 LEGACY_CONFIG_FIELDS = {
