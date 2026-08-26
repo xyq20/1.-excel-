@@ -1,6 +1,7 @@
 import unittest
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -17,6 +18,7 @@ from erp_excel_sync import (
 )
 
 
+@unittest.skipUnless(shutil.which("cmd.exe"), "Windows cmd.exe is required")
 class LauncherTests(unittest.TestCase):
     def test_batch_launcher_passes_script_and_config_to_python(self):
         launcher = Path(__file__).resolve().parents[1] / "run_sync.bat"
