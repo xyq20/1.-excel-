@@ -5,6 +5,7 @@ from xml.etree import ElementTree as ET
 
 from monthly_schedule import resolve_sync_cycle
 from xlsx_monthly import (
+    apply_monthly_values,
     WorkbookLayout,
     column_label,
     column_number,
@@ -16,6 +17,7 @@ from xlsx_monthly import (
     shift_qualified_worksheet_formulas,
     update_workbook_xml,
 )
+from erp_excel_sync import MatchResult, RETURN_RATE_FIELD, choose_candidate
 
 
 def workbook_sheet(
@@ -359,6 +361,242 @@ class MonthInsertionTests(unittest.TestCase):
         result = insert_month_column(source, [], resolve_sync_cycle(date(2026, 9, 15)))
 
         self.assertIn(b'<row r="2" spans="24:28">', result.sheet_xml)
+
+
+class MonthlyValueWriteTests(unittest.TestCase):
+    def _sheet(self, *, header_actual="8月实发（8.15）"):
+        rows = (
+            b'<row r="2"><c r="E2" s="5" t="s"><v>0</v></c><c r="F2" t="s"><v>1</v></c>'
+            b'<c r="X2" s="141"><f>stale peer</f><v>999</v></c>'
+            b'<c r="Y2" s="177"><v>10</v></c><c r="Z2" s="142"><f>stale change</f><v>8</v></c>'
+            b'<c r="AA2" s="219"><v>0.25</v></c></row>'
+            b'<row r="3"><c r="E3" t="s"><v>2</v></c><c r="F3" t="s"><v>3</v></c>'
+            b'<c r="X3" s="241"><v>4</v></c><c r="Y3" s="178"><v>20</v></c>'
+            b'<c r="Z3" s="242"><v>5</v></c><c r="AA3" s="220"><v>0.4</v></c></row>'
+            b'<row r="4"><c r="E4" t="s"><v>4</v></c><c r="F4" t="s"><v>5</v></c>'
+            b'<c r="X4" s="141"><v>7</v></c><c r="Y4" s="179"><v>30</v></c>'
+            b'<c r="Z4" s="142"><v>6</v></c><c r="AA4" s="221"><v>0.6</v></c></row>'
+        )
+        return workbook_sheet(
+            [
+                ("W", "7月实发"),
+                ("X", "同期销量"),
+                ("Y", header_actual),
+                ("Z", "变化情况"),
+                ("AA", "退货率（7.1-7.31）"),
+            ],
+            rows=rows,
+        )
+
+    def _apply(self, sheet, cycle, actual_rows, return_rows, **kwargs):
+        return apply_monthly_values(
+            sheet,
+            ["A-1", "Alpha", "B-2", "Beta", "Alias SKU", "Gamma"],
+            cycle,
+            actual_rows,
+            return_rows,
+            aliases=kwargs.get("aliases", {}),
+            critical_skus=kwargs.get("critical_skus", set()),
+            matcher=choose_candidate,
+        )
+
+    def test_uses_independent_datasets_and_never_leaks_unused_conflicting_fields(self):
+        cycle = resolve_sync_cycle(date(2026, 8, 15))
+        actual_rows = [{
+            "itemOuterId": "A-1", "title": "Alpha", "actualSysConsignCount": 123,
+            RETURN_RATE_FIELD: "99.99%",
+        }]
+        return_rows = [{
+            "itemOuterId": "A-1", "title": "Alpha", "actualSysConsignCount": 987,
+            RETURN_RATE_FIELD: "51.85%",
+        }]
+
+        result = self._apply(self._sheet(), cycle, actual_rows, return_rows)
+
+        self.assertIn(b'<c r="Y2" s="177"><v>123</v></c>', result.sheet_xml)
+        self.assertIn(b'<c r="AA2" s="219"><v>0.5185</v></c>', result.sheet_xml)
+        self.assertEqual(result.rows[0]["actual_status"], "exact")
+        self.assertEqual(result.rows[0]["return_status"], "exact")
+        self.assertEqual(result.rows[0]["changed_fields"], ("actual", "return"))
+
+    def test_updates_every_sheet_sku_row_even_when_not_critical(self):
+        cycle = resolve_sync_cycle(date(2026, 8, 15))
+        actual_rows = [
+            {"itemOuterId": "A-1", "title": "Alpha", "actualSysConsignCount": 11},
+            {"itemOuterId": "B-2", "title": "Beta", "actualSysConsignCount": 22},
+        ]
+        return_rows = [
+            {"itemOuterId": "A-1", "title": "Alpha", RETURN_RATE_FIELD: "10%"},
+            {"itemOuterId": "B-2", "title": "Beta", RETURN_RATE_FIELD: "20%"},
+        ]
+
+        result = self._apply(
+            self._sheet(), cycle, actual_rows, return_rows, critical_skus={"A-1"}
+        )
+
+        self.assertIn(b'<c r="Y3" s="178"><v>22</v></c>', result.sheet_xml)
+        self.assertIn(b'<c r="AA3" s="220"><v>0.2</v></c>', result.sheet_xml)
+        self.assertEqual(len(result.rows), 3)
+        self.assertEqual(len(result.critical_results), 1)
+
+    def test_actual_can_update_while_unmatched_return_retains_old_value_and_reports_field(self):
+        cycle = resolve_sync_cycle(date(2026, 8, 15))
+
+        result = self._apply(
+            self._sheet(), cycle,
+            [{"itemOuterId": "A-1", "title": "Alpha", "actualSysConsignCount": 77}],
+            [],
+        )
+
+        self.assertIn(b'<c r="Y2" s="177"><v>77</v></c>', result.sheet_xml)
+        self.assertIn(b'<c r="AA2" s="219"><v>0.25</v></c>', result.sheet_xml)
+        self.assertEqual(result.rows[0]["return_status"], "unmatched")
+        self.assertEqual(result.rows[0]["new_return"], "0.25")
+        self.assertTrue(any(item["field"] == "return" and item["row"] == 2 for item in result.review))
+
+    def test_exact_candidates_missing_their_own_field_retain_old_values_and_fail_critical(self):
+        cycle = resolve_sync_cycle(date(2026, 8, 15))
+
+        result = self._apply(
+            self._sheet(), cycle,
+            [{"itemOuterId": "A-1", "title": "Alpha", RETURN_RATE_FIELD: "99%"}],
+            [{"itemOuterId": "A-1", "title": "Alpha", "actualSysConsignCount": 999}],
+            critical_skus={"A-1"},
+        )
+
+        self.assertIn(b'<c r="Y2" s="177"><v>10</v></c>', result.sheet_xml)
+        self.assertIn(b'<c r="AA2" s="219"><v>0.25</v></c>', result.sheet_xml)
+        self.assertEqual(result.rows[0]["actual_status"], "missing_value")
+        self.assertEqual(result.rows[0]["return_status"], "missing_value")
+        self.assertEqual(
+            {(item["field"], item["status"]) for item in result.review if item["row"] == 2},
+            {("actual", "missing_value"), ("return", "missing_value")},
+        )
+        self.assertFalse(result.critical_results[0]["passed"])
+
+    def test_non_finite_target_values_are_reviewed_without_overwriting(self):
+        result = self._apply(
+            self._sheet(), resolve_sync_cycle(date(2026, 8, 15)),
+            [{"itemOuterId": "A-1", "title": "Alpha", "actualSysConsignCount": "inf"}],
+            [{"itemOuterId": "A-1", "title": "Alpha", RETURN_RATE_FIELD: "NaN"}],
+        )
+
+        self.assertIn(b'<c r="Y2" s="177"><v>10</v></c>', result.sheet_xml)
+        self.assertIn(b'<c r="AA2" s="219"><v>0.25</v></c>', result.sheet_xml)
+        self.assertEqual(result.rows[0]["actual_status"], "invalid_value")
+        self.assertEqual(result.rows[0]["return_status"], "invalid_value")
+
+    def test_alias_matches_both_windows_and_writes(self):
+        cycle = resolve_sync_cycle(date(2026, 8, 15))
+
+        result = self._apply(
+            self._sheet(), cycle,
+            [{"itemOuterId": "ERP-G", "title": "Gamma", "actualSysConsignCount": 44}],
+            [{"itemOuterId": "ERP-G", "title": "Gamma", RETURN_RATE_FIELD: "12.5%"}],
+            aliases={"alias sku": "erp-g"},
+        )
+
+        self.assertIn(b'<c r="Y4" s="179"><v>44</v></c>', result.sheet_xml)
+        self.assertIn(b'<c r="AA4" s="221"><v>0.125</v></c>', result.sheet_xml)
+        self.assertEqual(result.rows[2]["actual_status"], "alias")
+        self.assertEqual(result.rows[2]["return_status"], "alias")
+
+    def test_unsuffixed_erp_rate_is_percentage_points_even_below_one(self):
+        result = self._apply(
+            self._sheet(), resolve_sync_cycle(date(2026, 8, 15)), [],
+            [{"itemOuterId": "A-1", "title": "Alpha", RETURN_RATE_FIELD: "0.5"}],
+        )
+
+        self.assertIn(b'<c r="AA2" s="219"><v>0.005</v></c>', result.sheet_xml)
+
+    def test_critical_missing_or_partial_match_returns_failures_without_raising(self):
+        cycle = resolve_sync_cycle(date(2026, 8, 15))
+
+        result = self._apply(
+            self._sheet(), cycle,
+            [{"itemOuterId": "A-1", "title": "Alpha", "actualSysConsignCount": 1}],
+            [],
+            critical_skus={"A-1", "MISSING"},
+        )
+
+        self.assertEqual(len(result.critical_results), 2)
+        self.assertEqual(len(result.critical_failures), 2)
+        by_sku = {item["sku"]: item for item in result.critical_results}
+        self.assertTrue(by_sku["a-1"]["sheet_exists"])
+        self.assertEqual(by_sku["a-1"]["actual_status"], "exact")
+        self.assertEqual(by_sku["a-1"]["return_status"], "unmatched")
+        self.assertFalse(by_sku["a-1"]["passed"])
+        self.assertFalse(by_sku["missing"]["sheet_exists"])
+
+    def test_critical_requires_auto_write_even_when_matcher_uses_an_exact_status(self):
+        def blocked_matcher(sheet_sku, sheet_name, rows, aliases):
+            return MatchResult(
+                "exact", rows[0] if rows else None, 1.0, False, ("candidate",)
+            )
+
+        result = apply_monthly_values(
+            self._sheet(),
+            ["A-1", "Alpha", "B-2", "Beta", "Alias SKU", "Gamma"],
+            resolve_sync_cycle(date(2026, 8, 15)),
+            [{"itemOuterId": "A-1", "title": "Alpha", "actualSysConsignCount": 1}],
+            [{"itemOuterId": "A-1", "title": "Alpha", RETURN_RATE_FIELD: "1%"}],
+            aliases={},
+            critical_skus={"A-1"},
+            matcher=blocked_matcher,
+        )
+
+        self.assertFalse(result.critical_results[0]["passed"])
+        self.assertEqual(len(result.critical_failures), 1)
+
+    def test_critical_reports_are_sorted_after_normalization(self):
+        result = self._apply(
+            self._sheet(), resolve_sync_cycle(date(2026, 8, 15)), [], [],
+            critical_skus=[" Z ", "A"],
+        )
+
+        self.assertEqual(
+            [item["sku"] for item in result.critical_results],
+            ["a", "z"],
+        )
+
+    def test_replaces_formulas_for_every_sku_row_preserving_styles_without_caches(self):
+        cycle = resolve_sync_cycle(date(2024, 3, 15))
+        sheet = self._sheet(header_actual="3月实发（3.15）").replace(
+            "7月实发".encode(), "2月实发".encode()
+        )
+
+        result = self._apply(sheet, cycle, [], [])
+
+        self.assertEqual(result.formula_count, 6)
+        self.assertIn(b'<c r="X2" s="141"><f>W2/29*14</f></c>', result.sheet_xml)
+        self.assertIn(b'<c r="X3" s="241"><f>W3/29*14</f></c>', result.sheet_xml)
+        self.assertIn(
+            'c r="Z2" s="142"><f>TEXT(Y2-X2,"3月增加0件；3月减少0件；持平")</f></c>'.encode(),
+            result.sheet_xml,
+        )
+        self.assertNotRegex(result.sheet_xml, rb'<c r="(?:X|Z)[234]"[^>]*><f>.*?</f><v>')
+
+    def test_first_node_renames_staged_headers_without_insertion(self):
+        cycle = resolve_sync_cycle(date(2026, 9, 1))
+
+        result = self._apply(self._sheet(), cycle, [], [])
+
+        self.assertFalse(result.inserted)
+        self.assertIn("8月实发".encode(), result.sheet_xml)
+        self.assertNotIn("8月实发（8.15）".encode(), result.sheet_xml)
+        self.assertIn("退货率（7.15-8.15）".encode(), result.sheet_xml)
+        self.assertEqual(result.layout.actual_col, "Y")
+
+    def test_fifteenth_inserts_new_month_once_then_refreshes_idempotently(self):
+        cycle = resolve_sync_cycle(date(2026, 9, 15))
+
+        first = self._apply(self._sheet(), cycle, [], [])
+        second = self._apply(first.sheet_xml, cycle, [], [])
+
+        self.assertTrue(first.inserted)
+        self.assertFalse(second.inserted)
+        self.assertEqual(second.sheet_xml, first.sheet_xml)
+        self.assertEqual(second.layout.actual_col, "Z")
 
 
 class WorkbookAndDrawingTests(unittest.TestCase):

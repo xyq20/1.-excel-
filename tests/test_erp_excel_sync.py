@@ -138,6 +138,25 @@ class DateWindowTests(unittest.TestCase):
 
 
 class CandidateMatchingTests(unittest.TestCase):
+    def test_independent_windows_can_choose_different_records_for_the_same_sheet_row(self):
+        actual = choose_candidate(
+            "A-1", "Alpha",
+            [{"itemOuterId": "A-1", "title": "Alpha", "actualSysConsignCount": 12,
+              "customA1ED4F3EEFEF30DBB8E9A9A4823B79A3": "99%"}],
+            aliases={},
+        )
+        returns = choose_candidate(
+            "A-1", "Alpha",
+            [{"itemOuterId": "A-1", "title": "Alpha", "actualSysConsignCount": 999,
+              "customA1ED4F3EEFEF30DBB8E9A9A4823B79A3": "20%"}],
+            aliases={},
+        )
+
+        self.assertEqual(actual.candidate["actualSysConsignCount"], 12)
+        self.assertEqual(
+            returns.candidate["customA1ED4F3EEFEF30DBB8E9A9A4823B79A3"], "20%"
+        )
+
     def test_uses_product_name_to_resolve_duplicate_exact_skus(self):
         candidates = [
             {"itemOuterId": "7023", "title": "26ss美式复古水洗短裤", "actualSysConsignCount": 0},

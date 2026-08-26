@@ -2,10 +2,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import html
+import math
 import re
-from typing import Callable
+from typing import Any, Callable
 
-from monthly_schedule import SyncCycle, actual_header, previous_month_start
+from monthly_schedule import (
+    SyncCycle,
+    actual_header,
+    change_formula,
+    peer_formula,
+    previous_month_start,
+    return_header,
+)
 
 
 MAX_EXCEL_COLUMN = 16384
@@ -48,6 +56,18 @@ class MonthInsertionResult:
     sheet_xml: bytes
     layout: WorkbookLayout
     inserted: bool
+
+
+@dataclass(frozen=True)
+class MonthlyWriteResult:
+    sheet_xml: bytes
+    layout: WorkbookLayout
+    inserted: bool
+    rows: tuple[dict[str, Any], ...]
+    review: tuple[dict[str, Any], ...]
+    critical_results: tuple[dict[str, Any], ...]
+    critical_failures: tuple[dict[str, Any], ...]
+    formula_count: int
 
 
 def column_number(col: str) -> int:
@@ -476,6 +496,276 @@ def _write_inline_header(
     escaped = html.escape(value, quote=False).encode("utf-8")
     cell = opening + b' t="inlineStr"><is><t>' + escaped + b"</t></is></c>"
     return _insert_or_replace_cell(row, col, row_number, cell)
+
+
+def _normalize_sku(value: Any) -> str:
+    text = str(value or "").casefold()
+    text = re.sub(r"[‐‑‒–—―]", "-", text)
+    return re.sub(r"\s+", "", text)
+
+
+def _rate_number(value: Any) -> float:
+    text = str(value or "0").strip()
+    if text.endswith("%"):
+        text = text[:-1].strip()
+    number = float(text or 0)
+    if not math.isfinite(number):
+        raise ValueError("return rate must be finite")
+    return number / 100.0
+
+
+def _number_text(value: float) -> str:
+    return ("%.10f" % value).rstrip("0").rstrip(".") or "0"
+
+
+def _set_cell_number(
+    row: bytes,
+    col: str,
+    row_number: int,
+    value: str,
+) -> bytes:
+    existing = next(
+        (cell for cell in CELL_RE.finditer(row) if _cell_col(cell) == col),
+        None,
+    )
+    if existing is None:
+        opening = f'<c r="{col}{row_number}"'.encode("ascii")
+    else:
+        opening = existing.group(0).split(b">", 1)[0].rstrip(b"/")
+        opening = re.sub(rb'\s+t="[^"]*"', b"", opening)
+        opening = re.sub(rb'\s+vm="[^"]*"', b"", opening)
+    cell = opening + b"><v>" + value.encode("ascii") + b"</v></c>"
+    return _insert_or_replace_cell(row, col, row_number, cell)
+
+
+def _set_cell_formula(
+    row: bytes,
+    col: str,
+    row_number: int,
+    formula: str,
+) -> bytes:
+    existing = next(
+        (cell for cell in CELL_RE.finditer(row) if _cell_col(cell) == col),
+        None,
+    )
+    if existing is None:
+        opening = f'<c r="{col}{row_number}"'.encode("ascii")
+    else:
+        opening = existing.group(0).split(b">", 1)[0].rstrip(b"/")
+        opening = re.sub(rb'\s+t="[^"]*"', b"", opening)
+        opening = re.sub(rb'\s+vm="[^"]*"', b"", opening)
+    encoded = html.escape(formula, quote=False).encode("utf-8")
+    cell = opening + b"><f>" + encoded + b"</f></c>"
+    return _insert_or_replace_cell(row, col, row_number, cell)
+
+
+def apply_monthly_values(
+    sheet_xml: bytes,
+    shared_strings: list[str],
+    cycle: SyncCycle,
+    actual_rows: list[dict[str, Any]],
+    return_rows: list[dict[str, Any]],
+    aliases: dict[str, str],
+    critical_skus: set[str],
+    matcher: Callable[[Any, Any, list[dict[str, Any]], dict[str, str]], Any],
+) -> MonthlyWriteResult:
+    insertion = insert_month_column(sheet_xml, shared_strings, cycle)
+    layout = insertion.layout
+    normalized_aliases = {
+        _normalize_sku(source): _normalize_sku(target)
+        for source, target in aliases.items()
+    }
+    rows_report: list[dict[str, Any]] = []
+    review: list[dict[str, Any]] = []
+    row_matches: dict[str, list[dict[str, Any]]] = {}
+    formula_count = 0
+
+    def update_row(match: re.Match[bytes]) -> bytes:
+        nonlocal formula_count
+        row_number = int(match.group("row"))
+        row = match.group(0)
+        if row_number == layout.header_row:
+            row = _write_inline_header(
+                row, layout.actual_col, row_number, actual_header(cycle)
+            )
+            return _write_inline_header(
+                row, layout.return_col, row_number, return_header(cycle)
+            )
+
+        sheet_sku = _cell_value(row, "E", shared_strings)
+        if not sheet_sku:
+            return row
+        sheet_name = _cell_value(row, "F", shared_strings)
+        actual_match = matcher(
+            sheet_sku, sheet_name, actual_rows, normalized_aliases
+        )
+        return_match = matcher(
+            sheet_sku, sheet_name, return_rows, normalized_aliases
+        )
+        old_actual = _cell_value(row, layout.actual_col, shared_strings)
+        old_return = _cell_value(row, layout.return_col, shared_strings)
+        new_actual = old_actual
+        new_return = old_return
+        changed: list[str] = []
+        actual_status = actual_match.status
+        return_status = return_match.status
+        actual_auto_write = False
+        return_auto_write = False
+
+        if actual_match.auto_write and actual_match.candidate is not None:
+            try:
+                raw_actual = actual_match.candidate["actualSysConsignCount"]
+                if raw_actual is None or str(raw_actual).strip() == "":
+                    raise KeyError("actualSysConsignCount")
+                parsed_actual = float(raw_actual)
+                if not math.isfinite(parsed_actual):
+                    raise ValueError("actual count must be finite")
+                new_actual = str(int(parsed_actual))
+            except KeyError:
+                actual_status = "missing_value"
+            except (TypeError, ValueError):
+                actual_status = "invalid_value"
+            else:
+                actual_auto_write = True
+                row = _set_cell_number(row, layout.actual_col, row_number, new_actual)
+                if new_actual != old_actual:
+                    changed.append("actual")
+        if not actual_auto_write:
+            new_actual = old_actual
+            review.append(_review_record(
+                "actual", row_number, sheet_sku, sheet_name, actual_match,
+                status=actual_status,
+            ))
+
+        if return_match.auto_write and return_match.candidate is not None:
+            try:
+                raw_return = return_match.candidate[
+                    "customA1ED4F3EEFEF30DBB8E9A9A4823B79A3"
+                ]
+                if raw_return is None or str(raw_return).strip() == "":
+                    raise KeyError("return rate")
+                new_return = _number_text(_rate_number(raw_return))
+            except KeyError:
+                return_status = "missing_value"
+            except (TypeError, ValueError):
+                return_status = "invalid_value"
+            else:
+                return_auto_write = True
+                row = _set_cell_number(
+                    row, layout.return_col, row_number, new_return
+                )
+                if new_return != old_return:
+                    changed.append("return")
+        if not return_auto_write:
+            new_return = old_return
+            review.append(_review_record(
+                "return", row_number, sheet_sku, sheet_name, return_match,
+                status=return_status,
+            ))
+
+        row = _set_cell_formula(
+            row,
+            layout.peer_col,
+            row_number,
+            peer_formula(layout.previous_col, row_number, cycle),
+        )
+        row = _set_cell_formula(
+            row,
+            layout.change_col,
+            row_number,
+            change_formula(layout.actual_col, layout.peer_col, row_number, cycle),
+        )
+        formula_count += 2
+
+        report_row = {
+            "row": row_number,
+            "sheet_sku": sheet_sku,
+            "sheet_name": sheet_name,
+            "actual_status": actual_status,
+            "actual_auto_write": actual_auto_write,
+            "actual_candidate_sku": _candidate_value(actual_match, "itemOuterId"),
+            "actual_candidate_title": _candidate_value(actual_match, "title"),
+            "return_status": return_status,
+            "return_auto_write": return_auto_write,
+            "return_candidate_sku": _candidate_value(return_match, "itemOuterId"),
+            "return_candidate_title": _candidate_value(return_match, "title"),
+            "old_actual": old_actual,
+            "new_actual": new_actual,
+            "old_return": old_return,
+            "new_return": new_return,
+            "changed_fields": tuple(changed),
+        }
+        rows_report.append(report_row)
+        row_matches.setdefault(_normalize_sku(sheet_sku), []).append(report_row)
+        return row
+
+    patched = ROW_RE.sub(update_row, insertion.sheet_xml)
+    critical_results: list[dict[str, Any]] = []
+    for sku in sorted({_normalize_sku(raw_sku) for raw_sku in critical_skus}):
+        matches = row_matches.get(sku, [])
+        selected = matches[0] if matches else None
+        critical_results.append({
+            "sku": sku,
+            "sheet_exists": bool(matches),
+            "actual_status": selected["actual_status"] if selected else "missing",
+            "return_status": selected["return_status"] if selected else "missing",
+            "actual_candidate_sku": selected["actual_candidate_sku"] if selected else "",
+            "actual_candidate_title": selected["actual_candidate_title"] if selected else "",
+            "return_candidate_sku": selected["return_candidate_sku"] if selected else "",
+            "return_candidate_title": selected["return_candidate_title"] if selected else "",
+            "passed": bool(
+                selected
+                and selected["actual_auto_write"]
+                and selected["return_auto_write"]
+            ),
+        })
+    critical_failures = tuple(
+        item for item in critical_results if not item["passed"]
+    )
+    return MonthlyWriteResult(
+        sheet_xml=patched,
+        layout=layout,
+        inserted=insertion.inserted,
+        rows=tuple(rows_report),
+        review=tuple(review),
+        critical_results=tuple(critical_results),
+        critical_failures=critical_failures,
+        formula_count=formula_count,
+    )
+
+
+def _cell_value(row: bytes, col: str, shared_strings: list[str]) -> str:
+    cell = next(
+        (candidate for candidate in CELL_RE.finditer(row) if _cell_col(candidate) == col),
+        None,
+    )
+    return _cell_text(cell, shared_strings) if cell is not None else ""
+
+
+def _candidate_value(result: Any, field: str) -> Any:
+    return result.candidate.get(field, "") if result.candidate else ""
+
+
+def _review_record(
+    field: str,
+    row_number: int,
+    sheet_sku: str,
+    sheet_name: str,
+    result: Any,
+    *,
+    status: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "field": field,
+        "row": row_number,
+        "sheet_sku": sheet_sku,
+        "sheet_name": sheet_name,
+        "status": status or result.status,
+        "confidence": round(result.confidence, 4),
+        "candidate_sku": _candidate_value(result, "itemOuterId"),
+        "candidate_title": _candidate_value(result, "title"),
+        "different_columns": tuple(result.differences),
+    }
 
 
 def _tag_attributes(tag: bytes) -> dict[str, str]:
