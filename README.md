@@ -14,7 +14,9 @@
 
 1. 确认 `config.json` 中的 `workbook` 指向要长期维护的主工作簿。相对路径以配置文件所在目录为基准。
 2. 关闭该工作簿的 WPS/Excel 编辑窗口，避免文件被锁定。
-3. Windows 上双击 `run_sync.bat`；或用 Python 3.10+ 运行：
+3. Mac 上双击 `一键同步.command`；Windows 上双击 `run_sync.bat`。Mac 首次如果拦截，请右键文件选择“打开”。
+
+也可以用 Python 3.10+ 命令行运行：
 
 ```powershell
 python .\erp_excel_sync.py --config .\config.json
