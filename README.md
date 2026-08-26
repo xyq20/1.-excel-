@@ -22,7 +22,7 @@
 python .\erp_excel_sync.py --config .\config.json
 ```
 
-未设置 `ERP_COOKIE` 时，脚本会提示粘贴ERP登录 Cookie。Cookie过期后重新登录并复制即可。
+Mac 首次双击运行时会提示粘贴 ERP 登录 Cookie，然后安全保存到 macOS 钥匙串；后续运行会自动读取，无需重复输入。Cookie 过期时，在“钥匙串访问”中删除名为 `ERP Excel Sync` 的项目，再次运行即会提示输入新 Cookie。Windows 或命令行未设置 `ERP_COOKIE` 时，Python 程序仍会提示输入。
 
 ## 匹配、校验与保存
 

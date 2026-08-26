@@ -42,6 +42,37 @@ done
 
 [[ -n "$PYTHON_CMD" ]] || fail '未找到 Python 3.10 或更高版本，请先安装 Python。'
 
+KEYCHAIN_SERVICE='ERP Excel Sync'
+KEYCHAIN_ACCOUNT="${USER:-erp-sync-user}"
+COOKIE_SOURCE='environment'
+
+if [[ -z "${ERP_COOKIE:-}" ]]; then
+  ERP_COOKIE="$(security find-generic-password \
+    -s "$KEYCHAIN_SERVICE" \
+    -a "$KEYCHAIN_ACCOUNT" \
+    -w 2>/dev/null || true)"
+  [[ -n "$ERP_COOKIE" ]] && COOKIE_SOURCE='keychain'
+fi
+
+if [[ -z "${ERP_COOKIE:-}" ]]; then
+  printf '首次运行，请粘贴 ERP Cookie（输入不会显示）：'
+  IFS= read -r -s ERP_COOKIE
+  printf '\n'
+  [[ -n "$ERP_COOKIE" ]] || fail 'ERP Cookie 不能为空。'
+  security add-generic-password \
+    -U \
+    -s "$KEYCHAIN_SERVICE" \
+    -a "$KEYCHAIN_ACCOUNT" \
+    -w "$ERP_COOKIE" >/dev/null 2>&1 || \
+    fail '无法将 ERP Cookie 保存到 macOS 钥匙串。'
+  printf '[已保存] ERP Cookie 已安全存入 macOS 钥匙串。\n'
+elif [[ "$COOKIE_SOURCE" == 'keychain' ]]; then
+  printf '[已读取] 已从 macOS 钥匙串读取 ERP Cookie。\n'
+else
+  printf '[已读取] 已从环境变量读取 ERP Cookie。\n'
+fi
+export ERP_COOKIE
+
 printf '使用 Python：%s\n\n' "$($PYTHON_CMD --version 2>&1)"
 "$PYTHON_CMD" "$SCRIPT_DIR/erp_excel_sync.py" --config "$SCRIPT_DIR/config.json"
 SYNC_EXIT_CODE=$?
@@ -52,6 +83,7 @@ elif [[ "$SYNC_EXIT_CODE" -eq 2 ]]; then
   printf '\n[未替换] 关键货号校验未通过，请查看 reports 目录。\n'
 else
   printf '\n[失败] 同步程序退出，错误码：%s\n' "$SYNC_EXIT_CODE"
+  printf '如果报错提示 Cookie 或登录已失效，请在“钥匙串访问”中删除“ERP Excel Sync”后重新运行。\n'
 fi
 
 wait_to_close
