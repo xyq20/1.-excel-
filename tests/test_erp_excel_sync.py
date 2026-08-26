@@ -16,6 +16,7 @@ from erp_excel_sync import (
     compare_api_snapshots,
     date_window_ms,
     parse_runtime_args,
+    populate_calculated_return_rate,
     populate_derived_return_rate,
     run_monthly_sync,
     set_cell_value,
@@ -129,6 +130,24 @@ class DateWindowTests(unittest.TestCase):
         self.assertEqual(payload["tradeTypes"], "3")
         self.assertEqual(payload["asStatus"], "9,2,12")
 
+    def test_builds_before_shipment_return_payload(self):
+        payload = build_payload(
+            "2026-08-01", "2026-08-31", as_types=("5",)
+        )
+
+        self.assertEqual(payload["asStatus"], "9,2,12")
+        self.assertEqual(payload["asTypes"], "5")
+
+    def test_builds_overall_return_payload_without_exchange(self):
+        payload = build_payload(
+            "2026-08-01",
+            "2026-08-31",
+            as_types=("5", "1", "2", "7", "8", "10"),
+        )
+
+        self.assertEqual(payload["asTypes"], "5,1,2,7,8,10")
+        self.assertNotIn("4", payload["asTypes"].split(","))
+
 
 class MonthlyOrchestrationTests(unittest.TestCase):
     def _args(self, root: Path) -> SimpleNamespace:
@@ -141,6 +160,7 @@ class MonthlyOrchestrationTests(unittest.TestCase):
             snapshot_dir=root / "snapshots",
             report_dir=root / "reports",
             actual_json=None,
+            before_return_json=None,
             return_json=None,
             company_id="111873",
             cookie_env="ERP_COOKIE",
@@ -164,6 +184,7 @@ class MonthlyOrchestrationTests(unittest.TestCase):
             fetch_api_mock.side_effect = [
                 {"data": {"list": [{"itemOuterId": "A"}]}},
                 {"data": {"list": [{"itemOuterId": "B"}]}},
+                {"data": {"list": [{"itemOuterId": "C"}]}},
             ]
             prepare_mock.return_value = SimpleNamespace(
                 inserted=True,
@@ -179,8 +200,18 @@ class MonthlyOrchestrationTests(unittest.TestCase):
 
             self.assertEqual(result, 2)
             self.assertEqual(
-                [call.args[2:] for call in fetch_api_mock.call_args_list],
-                [("2026-09-01", "2026-09-14"), ("2026-08-01", "2026-08-31")],
+                [
+                    (call.args[2:], call.kwargs["as_types"])
+                    for call in fetch_api_mock.call_args_list
+                ],
+                [
+                    (("2026-09-01", "2026-09-14"), ()),
+                    (("2026-08-01", "2026-08-31"), ("5",)),
+                    (
+                        ("2026-08-01", "2026-08-31"),
+                        ("5", "1", "2", "7", "8", "10"),
+                    ),
+                ],
             )
             self.assertTrue((root / "reports" / "2026-09-15" / "summary.json").exists())
             self.assertTrue((root / "reports" / "2026-09-15" / "critical_skus.csv").exists())
@@ -200,9 +231,12 @@ class MonthlyOrchestrationTests(unittest.TestCase):
             args.dry_run = True
             actual = root / "actual.json"
             returns = root / "return.json"
+            before_returns = root / "before-return.json"
             actual.write_text('{"data":{"list":[]}}', encoding="utf-8")
             returns.write_text('{"data":{"list":[]}}', encoding="utf-8")
+            before_returns.write_text('{"data":{"list":[]}}', encoding="utf-8")
             args.actual_json = actual
+            args.before_return_json = before_returns
             args.return_json = returns
             prepare_mock.return_value = SimpleNamespace(
                 inserted=False,
@@ -311,6 +345,32 @@ class CandidateMatchingTests(unittest.TestCase):
 
 
 class ReviewTests(unittest.TestCase):
+    def test_calculated_rate_uses_own_sales_threshold_and_money(self):
+        rows = [
+            {"itemCount": 49, "rawRefundMoney": 25, "saleMoney": 100},
+            {"itemCount": 50, "rawRefundMoney": 25, "saleMoney": 100},
+        ]
+
+        populated = populate_calculated_return_rate(rows, "calculatedRate")
+
+        self.assertEqual(populated, 1)
+        self.assertIsNone(rows[0]["calculatedRate"])
+        self.assertEqual(rows[1]["calculatedRate"], "25.00%")
+
+    def test_calculated_rate_blanks_invalid_or_zero_sale_money(self):
+        rows = [
+            {"itemCount": 50, "rawRefundMoney": 0, "saleMoney": 0},
+            {"itemCount": 50, "rawRefundMoney": 1, "saleMoney": "NaN"},
+            {"itemCount": "bad", "rawRefundMoney": 1, "saleMoney": 2},
+        ]
+
+        populated = populate_calculated_return_rate(rows, "calculatedRate")
+
+        self.assertEqual(populated, 0)
+        self.assertEqual(
+            [row["calculatedRate"] for row in rows], [None, None, None]
+        )
+
     def test_derives_custom_return_rate_from_refund_and_sale_money(self):
         rows = [{"rawRefundMoney": 69331.11, "saleMoney": 172911.16}]
 

@@ -47,6 +47,8 @@ class WorkbookLayout:
     peer_col: str
     actual_col: str
     change_col: str
+    before_return_col: str
+    after_return_col: str
     return_col: str
     month_cols: tuple[str, ...]
     needs_insert: bool
@@ -134,7 +136,7 @@ def discover_layout(
         text = normalize_header(_cell_text(match, shared_strings))
         if (
             text in {"同期销量", "变化情况"}
-            or text.startswith("退货率")
+            or "退货率" in text
             or MONTH_HEADER_RE.fullmatch(text)
         ):
             cells.append((_cell_col(match), _cell_row(match), text))
@@ -147,8 +149,25 @@ def discover_layout(
 
     peer_col, peer_row = unique_header("同期销量", lambda text: text == "同期销量")
     change_col, change_row = unique_header("变化情况", lambda text: text == "变化情况")
-    return_col, return_row = unique_header("退货率", lambda text: text.startswith("退货率"))
-    if len({peer_row, change_row, return_row}) != 1:
+    before_return_col, before_return_row = unique_header(
+        "发货前退货率",
+        lambda text: text == "发货前退货率" or text.startswith("发货前退货率("),
+    )
+    after_return_col, after_return_row = unique_header(
+        "发货后退货率",
+        lambda text: text == "发货后退货率" or text.startswith("发货后退货率("),
+    )
+    return_col, return_row = unique_header(
+        "退货率",
+        lambda text: text == "退货率" or text.startswith("退货率("),
+    )
+    if len({
+        peer_row,
+        change_row,
+        before_return_row,
+        after_return_row,
+        return_row,
+    }) != 1:
         raise ValueError("core headers are not on the same row")
     header_row = peer_row
 
@@ -180,11 +199,22 @@ def discover_layout(
         peer_number,
         column_number(actual_col),
         change_number,
+        column_number(before_return_col),
+        column_number(after_return_col),
         column_number(return_col),
     )
-    if ordered_columns != tuple(sorted(ordered_columns)) or len(set(ordered_columns)) != 5:
+    if ordered_columns != tuple(sorted(ordered_columns)) or len(set(ordered_columns)) != 7:
         raise ValueError(
-            "invalid header column order; expected previous < peer < actual < change < return"
+            "invalid header column order; expected previous < peer < actual < change "
+            "< before return < after return < return"
+        )
+    if (
+        column_number(before_return_col),
+        column_number(after_return_col),
+        column_number(return_col),
+    ) != (change_number + 1, change_number + 2, change_number + 3):
+        raise ValueError(
+            "expected 发货前退货率 < 发货后退货率 < 退货率 immediately after 变化情况"
         )
 
     expected_month = cycle.actual_month.month
@@ -222,6 +252,8 @@ def discover_layout(
         peer_col=peer_col,
         actual_col=actual_col,
         change_col=change_col,
+        before_return_col=before_return_col,
+        after_return_col=after_return_col,
         return_col=return_col,
         month_cols=tuple(col for col, _month in month_headers),
         needs_insert=needs_insert,
@@ -540,6 +572,22 @@ def _set_cell_number(
     return _insert_or_replace_cell(row, col, row_number, cell)
 
 
+def _clear_cell_value(row: bytes, col: str, row_number: int) -> bytes:
+    existing = next(
+        (cell for cell in CELL_RE.finditer(row) if _cell_col(cell) == col),
+        None,
+    )
+    if existing is None:
+        opening = f'<c r="{col}{row_number}"'.encode("ascii")
+    else:
+        opening = existing.group(0).split(b">", 1)[0].rstrip(b"/")
+        opening = re.sub(rb'\s+t="[^"]*"', b"", opening)
+        opening = re.sub(rb'\s+vm="[^"]*"', b"", opening)
+    return _insert_or_replace_cell(
+        row, col, row_number, opening + b"/>",
+    )
+
+
 def _set_cell_formula(
     row: bytes,
     col: str,
@@ -702,7 +750,8 @@ def apply_monthly_values(
     shared_strings: list[str],
     cycle: SyncCycle,
     actual_rows: list[dict[str, Any]],
-    return_rows: list[dict[str, Any]],
+    before_return_rows: list[dict[str, Any]],
+    overall_return_rows: list[dict[str, Any]],
     aliases: dict[str, str],
     critical_skus: set[str],
     matcher: Callable[[Any, Any, list[dict[str, Any]], dict[str, str]], Any],
@@ -733,6 +782,18 @@ def apply_monthly_values(
             row = _write_inline_header(
                 row, layout.actual_col, row_number, actual_header(cycle)
             )
+            row = _write_inline_header(
+                row,
+                layout.before_return_col,
+                row_number,
+                return_header(cycle, "发货前退货率"),
+            )
+            row = _write_inline_header(
+                row,
+                layout.after_return_col,
+                row_number,
+                return_header(cycle, "发货后退货率"),
+            )
             return _write_inline_header(
                 row, layout.return_col, row_number, return_header(cycle)
             )
@@ -744,18 +805,31 @@ def apply_monthly_values(
         actual_match = matcher(
             sheet_sku, sheet_name, actual_rows, normalized_aliases
         )
-        return_match = matcher(
-            sheet_sku, sheet_name, return_rows, normalized_aliases
+        before_return_match = matcher(
+            sheet_sku, sheet_name, before_return_rows, normalized_aliases
+        )
+        overall_return_match = matcher(
+            sheet_sku, sheet_name, overall_return_rows, normalized_aliases
         )
         old_actual = _cell_value(row, layout.actual_col, shared_strings)
+        old_before_return = _cell_value(
+            row, layout.before_return_col, shared_strings
+        )
+        old_after_return = _cell_value(
+            row, layout.after_return_col, shared_strings
+        )
         old_return = _cell_value(row, layout.return_col, shared_strings)
         new_actual = old_actual
-        new_return = old_return
+        new_before_return = ""
+        new_after_return = ""
+        new_return = ""
         changed: list[str] = []
         actual_status = actual_match.status
-        return_status = return_match.status
+        before_return_status = before_return_match.status
+        return_status = overall_return_match.status
         actual_auto_write = False
-        return_auto_write = False
+        before_return_match_ok = False
+        return_match_ok = False
 
         if (
             actual_match.auto_write
@@ -794,35 +868,77 @@ def apply_monthly_values(
                 status=actual_status,
             ))
 
-        if (
-            return_match.auto_write
-            and return_match.status in {"exact", "alias"}
-            and return_match.candidate is not None
-        ):
-            try:
-                raw_return = return_match.candidate[
-                    "customA1ED4F3EEFEF30DBB8E9A9A4823B79A3"
-                ]
-                if raw_return is None or str(raw_return).strip() == "":
-                    raise KeyError("return rate")
-                new_return = _number_text(_rate_number(raw_return))
-            except KeyError:
-                return_status = "missing_value"
-            except (TypeError, ValueError):
-                return_status = "invalid_value"
-            else:
-                return_auto_write = True
-                row = _set_cell_number(
-                    row, layout.return_col, row_number, new_return
-                )
-                if new_return != old_return:
-                    changed.append("return")
-        if not return_auto_write:
-            new_return = old_return
-            review.append(_review_record(
-                "return", row_number, sheet_sku, sheet_name, return_match,
-                status=return_status,
-            ))
+        def update_return_rate(
+            result: Any,
+            value_field: str,
+            col: str,
+            field_name: str,
+            old_value: str,
+        ) -> tuple[bytes, str, str, bool]:
+            current_row = row
+            status = result.status
+            match_ok = bool(
+                result.auto_write
+                and result.status in {"exact", "alias"}
+                and result.candidate is not None
+            )
+            new_value = ""
+            if match_ok:
+                raw_value = result.candidate.get(value_field)
+                if raw_value is None or str(raw_value).strip() == "":
+                    try:
+                        sales_count = Decimal(str(result.candidate["itemCount"]))
+                    except (KeyError, InvalidOperation, TypeError, ValueError):
+                        status = "invalid_value"
+                    else:
+                        status = (
+                            "below_threshold"
+                            if sales_count.is_finite() and sales_count < 50
+                            else "invalid_value"
+                        )
+                else:
+                    try:
+                        new_value = _number_text(_rate_number(raw_value))
+                    except (TypeError, ValueError):
+                        status = "invalid_value"
+                    else:
+                        current_row = _set_cell_number(
+                            current_row, col, row_number, new_value
+                        )
+            if not new_value:
+                current_row = _clear_cell_value(current_row, col, row_number)
+            if new_value != old_value:
+                changed.append(field_name)
+            if not match_ok or status == "invalid_value":
+                review.append(_review_record(
+                    field_name,
+                    row_number,
+                    sheet_sku,
+                    sheet_name,
+                    result,
+                    status=status,
+                ))
+            return current_row, new_value, status, match_ok
+
+        row, new_before_return, before_return_status, before_return_match_ok = (
+            update_return_rate(
+                before_return_match,
+                "calculatedBeforeShipmentReturnRate",
+                layout.before_return_col,
+                "before_return",
+                old_before_return,
+            )
+        )
+        row = _clear_cell_value(row, layout.after_return_col, row_number)
+        if old_after_return:
+            changed.append("after_return")
+        row, new_return, return_status, return_match_ok = update_return_rate(
+            overall_return_match,
+            "calculatedOverallReturnRate",
+            layout.return_col,
+            "return",
+            old_return,
+        )
 
         row = _set_cell_formula(
             row,
@@ -849,12 +965,28 @@ def apply_monthly_values(
             "actual_auto_write": actual_auto_write,
             "actual_candidate_sku": _candidate_value(actual_match, "itemOuterId"),
             "actual_candidate_title": _candidate_value(actual_match, "title"),
+            "before_return_status": before_return_status,
+            "before_return_match_ok": before_return_match_ok,
+            "before_return_candidate_sku": _candidate_value(
+                before_return_match, "itemOuterId"
+            ),
+            "before_return_candidate_title": _candidate_value(
+                before_return_match, "title"
+            ),
             "return_status": return_status,
-            "return_auto_write": return_auto_write,
-            "return_candidate_sku": _candidate_value(return_match, "itemOuterId"),
-            "return_candidate_title": _candidate_value(return_match, "title"),
+            "return_match_ok": return_match_ok,
+            "return_candidate_sku": _candidate_value(
+                overall_return_match, "itemOuterId"
+            ),
+            "return_candidate_title": _candidate_value(
+                overall_return_match, "title"
+            ),
             "old_actual": old_actual,
             "new_actual": new_actual,
+            "old_before_return": old_before_return,
+            "new_before_return": new_before_return,
+            "old_after_return": old_after_return,
+            "new_after_return": new_after_return,
             "old_return": old_return,
             "new_return": new_return,
             "changed_fields": tuple(changed),
@@ -876,14 +1008,24 @@ def apply_monthly_values(
             "sheet_exists": bool(matches),
             "actual_status": selected["actual_status"] if selected else "missing",
             "return_status": selected["return_status"] if selected else "missing",
+            "before_return_status": (
+                selected["before_return_status"] if selected else "missing"
+            ),
             "actual_candidate_sku": selected["actual_candidate_sku"] if selected else "",
             "actual_candidate_title": selected["actual_candidate_title"] if selected else "",
+            "before_return_candidate_sku": (
+                selected["before_return_candidate_sku"] if selected else ""
+            ),
+            "before_return_candidate_title": (
+                selected["before_return_candidate_title"] if selected else ""
+            ),
             "return_candidate_sku": selected["return_candidate_sku"] if selected else "",
             "return_candidate_title": selected["return_candidate_title"] if selected else "",
             "passed": bool(
                 selected
                 and selected["actual_auto_write"]
-                and selected["return_auto_write"]
+                and selected["before_return_match_ok"]
+                and selected["return_match_ok"]
             ),
         })
     critical_failures = tuple(
@@ -948,6 +1090,28 @@ def validate_monthly_sheet(
         raise RuntimeError(
             f"actual header mismatch: found {found_actual!r}, expected {expected_actual!r}"
         )
+    found_before_return = normalize_header(
+        _cell_value(header_row, layout.before_return_col, shared_strings)
+    )
+    expected_before_return = normalize_header(
+        return_header(cycle, "发货前退货率")
+    )
+    if found_before_return != expected_before_return:
+        raise RuntimeError(
+            "before return header mismatch: "
+            f"found {found_before_return!r}, expected {expected_before_return!r}"
+        )
+    found_after_return = normalize_header(
+        _cell_value(header_row, layout.after_return_col, shared_strings)
+    )
+    expected_after_return = normalize_header(
+        return_header(cycle, "发货后退货率")
+    )
+    if found_after_return != expected_after_return:
+        raise RuntimeError(
+            "after return header mismatch: "
+            f"found {found_after_return!r}, expected {expected_after_return!r}"
+        )
     found_return = normalize_header(
         _cell_value(header_row, layout.return_col, shared_strings)
     )
@@ -994,6 +1158,8 @@ def validate_monthly_sheet(
         "peer_formula_count": peer_count,
         "change_formula_count": change_count,
         "actual_header": found_actual,
+        "before_return_header": found_before_return,
+        "after_return_header": found_after_return,
         "return_header": found_return,
         "layout": {
             "header_row": layout.header_row,
@@ -1001,6 +1167,8 @@ def validate_monthly_sheet(
             "peer_col": layout.peer_col,
             "actual_col": layout.actual_col,
             "change_col": layout.change_col,
+            "before_return_col": layout.before_return_col,
+            "after_return_col": layout.after_return_col,
             "return_col": layout.return_col,
             "month_cols": list(layout.month_cols),
             "needs_insert": layout.needs_insert,
@@ -1099,6 +1267,8 @@ def _rewrite_column_definitions(
         column_number(layout.peer_col) + 1,
         shifted_actual,
         column_number(layout.change_col) + 1,
+        column_number(layout.before_return_col) + 1,
+        column_number(layout.after_return_col) + 1,
         column_number(layout.return_col) + 1,
     }
     for number in visible:

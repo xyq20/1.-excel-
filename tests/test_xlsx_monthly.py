@@ -25,7 +25,9 @@ from xlsx_monthly import (
     update_workbook_xml,
 )
 from erp_excel_sync import (
+    BEFORE_RETURN_FIELD,
     MatchResult,
+    OVERALL_RETURN_FIELD,
     RETURN_RATE_FIELD,
     atomic_replace_master,
     choose_candidate,
@@ -67,8 +69,10 @@ def august_sheet(*, extras: bytes = b'<autoFilter ref="B1:AY10"/>') -> bytes:
         b'<row r="2"><c r="W2" s="140"><v>10</v></c>'
         b'<c r="X2" s="141"><f>W2/31*14</f><v>4</v></c>'
         b'<c r="Y2" s="141"><v>12</v></c>'
-        b'<c r="Z2" s="142"><f>TEXT(Y2-X2,&quot;Y2\xe5\x8e\x9f\xe6\x96\x87&quot;)+SUM($X$3:AA3)</f><v>0</v></c>'
-        b'<c r="AA2" s="219"><v>0.2</v></c></row>'
+        b'<c r="Z2" s="142"><f>TEXT(Y2-X2,&quot;Y2\xe5\x8e\x9f\xe6\x96\x87&quot;)+SUM($X$3:AC3)</f><v>0</v></c>'
+        b'<c r="AA2" s="219"><v>0.1</v></c>'
+        b'<c r="AB2" s="219"><v>0.15</v></c>'
+        b'<c r="AC2" s="219"><v>0.2</v></c></row>'
     )
     return workbook_sheet(
         [
@@ -76,7 +80,9 @@ def august_sheet(*, extras: bytes = b'<autoFilter ref="B1:AY10"/>') -> bytes:
             ("X", "同期销量"),
             ("Y", "8月实发（8.15）"),
             ("Z", "变化情况"),
-            ("AA", "退货率（7.1-7.31）"),
+            ("AA", "发货前退货率（7.1-7.31）"),
+            ("AB", "发货后退货率（7.1-7.31）"),
+            ("AC", "退货率（7.1-7.31）"),
         ],
         rows=rows,
         extras=extras,
@@ -98,7 +104,9 @@ def write_test_xlsx(
             ("X", "同期销量"),
             ("Y", "8月实发（8.15）"),
             ("Z", "变化情况"),
-            ("AA", "退货率（7.1-7.31）"),
+            ("AA", "发货前退货率（7.1-7.31）"),
+            ("AB", "发货后退货率（7.1-7.31）"),
+            ("AC", "退货率（7.1-7.31）"),
         ],
         rows=(
             b'<row r="2"><c r="E2" t="inlineStr"><is><t>SKU-1</t></is></c>'
@@ -107,7 +115,8 @@ def write_test_xlsx(
             b'<c r="Y2"><v>10</v></c><c r="Z2"><f>'
             + 'TEXT(Y2-X2,&quot;8月增加0件；8月减少0件；持平&quot;)'.encode()
             + b'</f></c>'
-            b'<c r="AA2"><v>0.1</v></c></row>'
+            b'<c r="AA2"><v>0.05</v></c><c r="AB2"/>'
+            b'<c r="AC2"><v>0.1</v></c></row>'
         ),
     )
     workbook = (
@@ -499,7 +508,9 @@ class LayoutDiscoveryTests(unittest.TestCase):
                 peer_col="X",
                 actual_col="Y",
                 change_col="Z",
-                return_col="AA",
+                before_return_col="AA",
+                after_return_col="AB",
+                return_col="AC",
                 month_cols=("W", "Y"),
                 needs_insert=False,
                 insert_before_col=None,
@@ -523,7 +534,7 @@ class LayoutDiscoveryTests(unittest.TestCase):
     def test_ambiguous_core_headers_raise_value_error(self):
         sheet = august_sheet().replace(
             b'</row>',
-            b'<c r="AB1" t="inlineStr"><is><t>\xe5\x90\x8c\xe6\x9c\x9f\xe9\x94\x80\xe9\x87\x8f</t></is></c></row>',
+            b'<c r="AD1" t="inlineStr"><is><t>\xe5\x90\x8c\xe6\x9c\x9f\xe9\x94\x80\xe9\x87\x8f</t></is></c></row>',
             1,
         )
 
@@ -536,8 +547,10 @@ class LayoutDiscoveryTests(unittest.TestCase):
                 ("W", "7月实发"),
                 ("X", "同期销量"),
                 ("Y", "8月实发（8.15）"),
-                ("Z", "退货率（7.1-7.31）"),
+                ("Z", "发货前退货率（7.1-7.31）"),
                 ("AA", "变化情况"),
+                ("AB", "发货后退货率（7.1-7.31）"),
+                ("AC", "退货率（7.1-7.31）"),
             ]
         )
 
@@ -551,7 +564,9 @@ class LayoutDiscoveryTests(unittest.TestCase):
                 ("X", "同期销量"),
                 ("Y", "9月实发（9.15）"),
                 ("Z", "变化情况"),
-                ("AA", "退货率（8.1-8.31）"),
+                ("AA", "发货前退货率（8.1-8.31）"),
+                ("AB", "发货后退货率（8.1-8.31）"),
+                ("AC", "退货率（8.1-8.31）"),
             ]
         )
 
@@ -632,9 +647,25 @@ class MonthInsertionTests(unittest.TestCase):
 
     def test_rediscovery_keeps_using_shared_strings_for_core_headers(self):
         source = august_sheet()
-        shared = ["7月实发", "同期销量", "8月实发（8.15）", "变化情况", "退货率（7.1-7.31）"]
+        shared = [
+            "7月实发",
+            "同期销量",
+            "8月实发（8.15）",
+            "变化情况",
+            "发货前退货率（7.1-7.31）",
+            "发货后退货率（7.1-7.31）",
+            "退货率（7.1-7.31）",
+        ]
         for index, (col, header) in enumerate(
-            (("W", shared[0]), ("X", shared[1]), ("Y", shared[2]), ("Z", shared[3]), ("AA", shared[4]))
+            (
+                ("W", shared[0]),
+                ("X", shared[1]),
+                ("Y", shared[2]),
+                ("Z", shared[3]),
+                ("AA", shared[4]),
+                ("AB", shared[5]),
+                ("AC", shared[6]),
+            )
         ):
             inline = (
                 f'<c r="{col}1" s="9" t="inlineStr"><is><t>{header}</t></is></c>'
@@ -679,9 +710,11 @@ class MonthInsertionTests(unittest.TestCase):
                 result.layout.peer_col,
                 result.layout.actual_col,
                 result.layout.change_col,
+                result.layout.before_return_col,
+                result.layout.after_return_col,
                 result.layout.return_col,
             ),
-            ("X", "Y", "Z", "AA", "AB"),
+            ("X", "Y", "Z", "AA", "AB", "AC", "AD"),
         )
         self.assertEqual(result.layout.month_cols, ("W", "X", "Z"))
         text = result.sheet_xml.decode("utf-8")
@@ -689,7 +722,7 @@ class MonthInsertionTests(unittest.TestCase):
         self.assertRegex(text, r'<c r="Z1"[^>]*t="inlineStr"[^>]*><is><t>9月实发（9\.15）</t></is></c>')
         self.assertRegex(text, r'<c r="X2"[^>]*s="141"[^>]*><v>12</v></c>')
         self.assertRegex(text, r'<c r="Z2"[^>]*s="141"[^>]*><v>12</v></c>')
-        self.assertIn('TEXT(Z2-Y2,"Y2原文")+SUM($Y$3:AB3)', text)
+        self.assertIn('TEXT(Z2-Y2,"Y2原文")+SUM($Y$3:AD3)', text)
         self.assertIn('autoFilter ref="B1:AZ10"', text)
         self.assertIn('dimension ref="A1:AZ10"', text)
         self.assertIn('mergeCell ref="W3:Y3"', text)
@@ -763,13 +796,16 @@ class MonthlyValueWriteTests(unittest.TestCase):
             b'<row r="2"><c r="E2" s="5" t="s"><v>0</v></c><c r="F2" t="s"><v>1</v></c>'
             b'<c r="X2" s="141"><f>stale peer</f><v>999</v></c>'
             b'<c r="Y2" s="177"><v>10</v></c><c r="Z2" s="142"><f>stale change</f><v>8</v></c>'
-            b'<c r="AA2" s="219"><v>0.25</v></c></row>'
+            b'<c r="AA2" s="219"><v>0.25</v></c><c r="AB2" s="219"><v>0.3</v></c>'
+            b'<c r="AC2" s="219"><v>0.25</v></c></row>'
             b'<row r="3"><c r="E3" t="s"><v>2</v></c><c r="F3" t="s"><v>3</v></c>'
             b'<c r="X3" s="241"><v>4</v></c><c r="Y3" s="178"><v>20</v></c>'
-            b'<c r="Z3" s="242"><v>5</v></c><c r="AA3" s="220"><v>0.4</v></c></row>'
+            b'<c r="Z3" s="242"><v>5</v></c><c r="AA3" s="220"><v>0.4</v></c>'
+            b'<c r="AB3" s="220"><v>0.45</v></c><c r="AC3" s="220"><v>0.4</v></c></row>'
             b'<row r="4"><c r="E4" t="s"><v>4</v></c><c r="F4" t="s"><v>5</v></c>'
             b'<c r="X4" s="141"><v>7</v></c><c r="Y4" s="179"><v>30</v></c>'
-            b'<c r="Z4" s="142"><v>6</v></c><c r="AA4" s="221"><v>0.6</v></c></row>'
+            b'<c r="Z4" s="142"><v>6</v></c><c r="AA4" s="221"><v>0.6</v></c>'
+            b'<c r="AB4" s="221"><v>0.65</v></c><c r="AC4" s="221"><v>0.6</v></c></row>'
         )
         return workbook_sheet(
             [
@@ -777,18 +813,36 @@ class MonthlyValueWriteTests(unittest.TestCase):
                 ("X", "同期销量"),
                 ("Y", header_actual),
                 ("Z", "变化情况"),
-                ("AA", "退货率（7.1-7.31）"),
+                ("AA", "发货前退货率（7.1-7.31）"),
+                ("AB", "发货后退货率（7.1-7.31）"),
+                ("AC", "退货率（7.1-7.31）"),
             ],
             rows=rows,
         )
 
     def _apply(self, sheet, cycle, actual_rows, return_rows, **kwargs):
+        def profile_rows(source, field):
+            converted = []
+            for item in source:
+                row = dict(item)
+                if RETURN_RATE_FIELD in row:
+                    row[field] = row[RETURN_RATE_FIELD]
+                converted.append(row)
+            return converted
+
         return apply_monthly_values(
             sheet,
             ["A-1", "Alpha", "B-2", "Beta", "Alias SKU", "Gamma"],
             cycle,
             actual_rows,
-            return_rows,
+            kwargs.get(
+                "before_return_rows",
+                profile_rows(return_rows, BEFORE_RETURN_FIELD),
+            ),
+            kwargs.get(
+                "overall_return_rows",
+                profile_rows(return_rows, OVERALL_RETURN_FIELD),
+            ),
             aliases=kwargs.get("aliases", {}),
             critical_skus=kwargs.get("critical_skus", set()),
             matcher=choose_candidate,
@@ -811,7 +865,46 @@ class MonthlyValueWriteTests(unittest.TestCase):
         self.assertIn(b'<c r="AA2" s="219"><v>0.5185</v></c>', result.sheet_xml)
         self.assertEqual(result.rows[0]["actual_status"], "exact")
         self.assertEqual(result.rows[0]["return_status"], "exact")
-        self.assertEqual(result.rows[0]["changed_fields"], ("actual", "return"))
+        self.assertEqual(
+            result.rows[0]["changed_fields"],
+            ("actual", "before_return", "after_return", "return"),
+        )
+
+    def test_profiles_use_independent_rates_and_below_threshold_clears_only_its_column(self):
+        cycle = resolve_sync_cycle(date(2026, 8, 15))
+        before_rows = [{
+            "itemOuterId": "A-1",
+            "title": "Alpha",
+            "itemCount": 50,
+            BEFORE_RETURN_FIELD: "25.00%",
+        }]
+        overall_rows = [{
+            "itemOuterId": "A-1",
+            "title": "Alpha",
+            "itemCount": 49,
+            OVERALL_RETURN_FIELD: None,
+        }]
+
+        result = self._apply(
+            self._sheet(),
+            cycle,
+            [{
+                "itemOuterId": "A-1",
+                "title": "Alpha",
+                "actualSysConsignCount": 123,
+            }],
+            [],
+            before_return_rows=before_rows,
+            overall_return_rows=overall_rows,
+            critical_skus={"A-1"},
+        )
+
+        self.assertIn(b'<c r="AA2" s="219"><v>0.25</v></c>', result.sheet_xml)
+        self.assertIn(b'<c r="AB2" s="219"/>', result.sheet_xml)
+        self.assertIn(b'<c r="AC2" s="219"/>', result.sheet_xml)
+        self.assertEqual(result.rows[0]["before_return_status"], "exact")
+        self.assertEqual(result.rows[0]["return_status"], "below_threshold")
+        self.assertTrue(result.critical_results[0]["passed"])
 
     def test_updates_every_sheet_sku_row_even_when_not_critical(self):
         cycle = resolve_sync_cycle(date(2026, 8, 15))
@@ -833,7 +926,7 @@ class MonthlyValueWriteTests(unittest.TestCase):
         self.assertEqual(len(result.rows), 3)
         self.assertEqual(len(result.critical_results), 1)
 
-    def test_actual_can_update_while_unmatched_return_retains_old_value_and_reports_field(self):
+    def test_actual_can_update_while_unmatched_returns_are_cleared_and_reported(self):
         cycle = resolve_sync_cycle(date(2026, 8, 15))
 
         result = self._apply(
@@ -843,12 +936,13 @@ class MonthlyValueWriteTests(unittest.TestCase):
         )
 
         self.assertIn(b'<c r="Y2" s="177"><v>77</v></c>', result.sheet_xml)
-        self.assertIn(b'<c r="AA2" s="219"><v>0.25</v></c>', result.sheet_xml)
+        self.assertIn(b'<c r="AA2" s="219"/>', result.sheet_xml)
+        self.assertIn(b'<c r="AC2" s="219"/>', result.sheet_xml)
         self.assertEqual(result.rows[0]["return_status"], "unmatched")
-        self.assertEqual(result.rows[0]["new_return"], "0.25")
+        self.assertEqual(result.rows[0]["new_return"], "")
         self.assertTrue(any(item["field"] == "return" and item["row"] == 2 for item in result.review))
 
-    def test_exact_candidates_missing_their_own_field_retain_old_values_and_fail_critical(self):
+    def test_exact_candidates_missing_their_own_field_clear_values_and_fail_critical(self):
         cycle = resolve_sync_cycle(date(2026, 8, 15))
 
         result = self._apply(
@@ -859,16 +953,21 @@ class MonthlyValueWriteTests(unittest.TestCase):
         )
 
         self.assertIn(b'<c r="Y2" s="177"><v>10</v></c>', result.sheet_xml)
-        self.assertIn(b'<c r="AA2" s="219"><v>0.25</v></c>', result.sheet_xml)
+        self.assertIn(b'<c r="AA2" s="219"/>', result.sheet_xml)
+        self.assertIn(b'<c r="AC2" s="219"/>', result.sheet_xml)
         self.assertEqual(result.rows[0]["actual_status"], "missing_value")
-        self.assertEqual(result.rows[0]["return_status"], "missing_value")
+        self.assertEqual(result.rows[0]["return_status"], "invalid_value")
         self.assertEqual(
             {(item["field"], item["status"]) for item in result.review if item["row"] == 2},
-            {("actual", "missing_value"), ("return", "missing_value")},
+            {
+                ("actual", "missing_value"),
+                ("before_return", "invalid_value"),
+                ("return", "invalid_value"),
+            },
         )
         self.assertFalse(result.critical_results[0]["passed"])
 
-    def test_non_finite_target_values_are_reviewed_without_overwriting(self):
+    def test_non_finite_target_values_are_reviewed_and_return_rates_are_cleared(self):
         result = self._apply(
             self._sheet(), resolve_sync_cycle(date(2026, 8, 15)),
             [{"itemOuterId": "A-1", "title": "Alpha", "actualSysConsignCount": "inf"}],
@@ -876,7 +975,8 @@ class MonthlyValueWriteTests(unittest.TestCase):
         )
 
         self.assertIn(b'<c r="Y2" s="177"><v>10</v></c>', result.sheet_xml)
-        self.assertIn(b'<c r="AA2" s="219"><v>0.25</v></c>', result.sheet_xml)
+        self.assertIn(b'<c r="AA2" s="219"/>', result.sheet_xml)
+        self.assertIn(b'<c r="AC2" s="219"/>', result.sheet_xml)
         self.assertEqual(result.rows[0]["actual_status"], "invalid_actual")
         self.assertEqual(result.rows[0]["return_status"], "invalid_value")
 
@@ -992,7 +1092,8 @@ class MonthlyValueWriteTests(unittest.TestCase):
             ["A-1", "Alpha", "B-2", "Beta", "Alias SKU", "Gamma"],
             resolve_sync_cycle(date(2026, 8, 15)),
             [{"itemOuterId": "A-1", "title": "Alpha", "actualSysConsignCount": 1}],
-            [{"itemOuterId": "A-1", "title": "Alpha", RETURN_RATE_FIELD: "1%"}],
+            [{"itemOuterId": "A-1", "title": "Alpha", BEFORE_RETURN_FIELD: "1%"}],
+            [{"itemOuterId": "A-1", "title": "Alpha", OVERALL_RETURN_FIELD: "1%"}],
             aliases={},
             critical_skus={"A-1"},
             matcher=blocked_matcher,
@@ -1009,12 +1110,14 @@ class MonthlyValueWriteTests(unittest.TestCase):
             "itemOuterId": "A-1",
             "title": "Alpha",
             "actualSysConsignCount": 999,
-            RETURN_RATE_FIELD: "99%",
+            BEFORE_RETURN_FIELD: "99%",
+            OVERALL_RETURN_FIELD: "99%",
         }
         result = apply_monthly_values(
             self._sheet(),
             ["A-1", "Alpha", "B-2", "Beta", "Alias SKU", "Gamma"],
             resolve_sync_cycle(date(2026, 8, 15)),
+            [candidate],
             [candidate],
             [candidate],
             aliases={},
@@ -1023,10 +1126,11 @@ class MonthlyValueWriteTests(unittest.TestCase):
         )
 
         self.assertIn(b'<c r="Y2" s="177"><v>10</v></c>', result.sheet_xml)
-        self.assertIn(b'<c r="AA2" s="219"><v>0.25</v></c>', result.sheet_xml)
+        self.assertIn(b'<c r="AA2" s="219"/>', result.sheet_xml)
+        self.assertIn(b'<c r="AC2" s="219"/>', result.sheet_xml)
         self.assertEqual(
             {(item["field"], item["status"]) for item in result.review if item["row"] == 2},
-            {("actual", "review"), ("return", "review")},
+            {("actual", "review"), ("before_return", "review"), ("return", "review")},
         )
         self.assertFalse(result.critical_results[0]["passed"])
         self.assertEqual(len(result.critical_failures), 1)
@@ -1089,7 +1193,9 @@ class MonthlyValueWriteTests(unittest.TestCase):
                 + formula_cells
                 + (
                     f'<c r="Y{row_number}" s="177"><v>10</v></c>'
-                    f'<c r="AA{row_number}" s="219"><v>0.1</v></c></row>'
+                    f'<c r="AA{row_number}" s="219"><v>0.1</v></c>'
+                    f'<c r="AB{row_number}" s="219"><v>0.2</v></c>'
+                    f'<c r="AC{row_number}" s="219"><v>0.3</v></c></row>'
                 ).encode("ascii")
             )
         source = workbook_sheet(
@@ -1098,7 +1204,9 @@ class MonthlyValueWriteTests(unittest.TestCase):
                 ("X", "同期销量"),
                 ("Y", "8月实发（8.15）"),
                 ("Z", "变化情况"),
-                ("AA", "退货率（7.1-7.31）"),
+                ("AA", "发货前退货率（7.1-7.31）"),
+                ("AB", "发货后退货率（7.1-7.31）"),
+                ("AC", "退货率（7.1-7.31）"),
             ],
             rows=b"".join(rows),
             extras=(
@@ -1113,11 +1221,11 @@ class MonthlyValueWriteTests(unittest.TestCase):
         cycle = resolve_sync_cycle(date(2026, 8, 15))
 
         first = apply_monthly_values(
-            source, [], cycle, [], [], aliases={}, critical_skus=set(),
+            source, [], cycle, [], [], [], aliases={}, critical_skus=set(),
             matcher=choose_candidate,
         )
         second = apply_monthly_values(
-            first.sheet_xml, [], cycle, [], [], aliases={}, critical_skus=set(),
+            first.sheet_xml, [], cycle, [], [], [], aliases={}, critical_skus=set(),
             matcher=choose_candidate,
         )
 

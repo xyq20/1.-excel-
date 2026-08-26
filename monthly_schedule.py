@@ -68,10 +68,10 @@ def actual_header(cycle: SyncCycle) -> str:
     return f"{month}月实发"
 
 
-def return_header(cycle: SyncCycle) -> str:
+def return_header(cycle: SyncCycle, prefix: str = "退货率") -> str:
     start = cycle.return_window.start
     end = cycle.return_window.end
-    return f"退货率（{start.month}.{start.day}-{end.month}.{end.day}）"
+    return f"{prefix}（{start.month}.{start.day}-{end.month}.{end.day}）"
 
 
 def peer_formula(previous_col: str, row: int, cycle: SyncCycle) -> str:

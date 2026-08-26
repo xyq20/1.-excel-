@@ -39,6 +39,9 @@ API_URL = "https://erp.superboss.cc/report/sale/dimensions/list"
 WORKSHEET_PATH = "xl/worksheets/sheet1.xml"
 MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 RETURN_RATE_FIELD = "customA1ED4F3EEFEF30DBB8E9A9A4823B79A3"
+BEFORE_RETURN_FIELD = "calculatedBeforeShipmentReturnRate"
+AFTER_RETURN_FIELD = "calculatedAfterShipmentReturnRate"
+OVERALL_RETURN_FIELD = "calculatedOverallReturnRate"
 COMPARE_FIELDS = ("actualSysConsignCount", RETURN_RATE_FIELD)
 DUPLICATE_NAME_MIN_SCORE = 0.60
 DUPLICATE_NAME_MIN_MARGIN = 0.15
@@ -77,6 +80,34 @@ class MatchResult:
 
 
 @dataclass(frozen=True)
+class ReturnRateProfile:
+    key: str
+    header_prefix: str
+    as_types: tuple[str, ...]
+    value_field: str
+    enabled: bool = True
+
+
+BEFORE_RETURN_PROFILE = ReturnRateProfile(
+    "before_shipment", "发货前退货率", ("5",), BEFORE_RETURN_FIELD
+)
+AFTER_RETURN_PROFILE = ReturnRateProfile(
+    "after_shipment", "发货后退货率", (), AFTER_RETURN_FIELD, False
+)
+OVERALL_RETURN_PROFILE = ReturnRateProfile(
+    "overall",
+    "退货率",
+    ("5", "1", "2", "7", "8", "10"),
+    OVERALL_RETURN_FIELD,
+)
+RETURN_RATE_PROFILES = (
+    BEFORE_RETURN_PROFILE,
+    AFTER_RETURN_PROFILE,
+    OVERALL_RETURN_PROFILE,
+)
+
+
+@dataclass(frozen=True)
 class PreparedMonthlyUpdate:
     inserted: bool
     formula_count: int
@@ -93,11 +124,17 @@ def date_window_ms(start_date: str, end_date: str) -> tuple[int, int]:
     return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
 
 
-def build_payload(start_date: str, end_date: str) -> dict[str, str]:
+def build_payload(
+    start_date: str,
+    end_date: str,
+    *,
+    as_types: tuple[str, ...] = (),
+) -> dict[str, str]:
     start_ms, end_ms = date_window_ms(start_date, end_date)
     payload = dict(parse_qsl(BASE_FORM_BODY, keep_blank_values=True))
     payload["startTime"] = str(start_ms)
     payload["endTime"] = str(end_ms)
+    payload["asTypes"] = ",".join(as_types)
     return payload
 
 
@@ -377,8 +414,10 @@ def fetch_api(
     start_date: str,
     end_date: str,
     timeout: int = 120,
+    *,
+    as_types: tuple[str, ...] = (),
 ) -> dict[str, Any]:
-    payload = build_payload(start_date, end_date)
+    payload = build_payload(start_date, end_date, as_types=as_types)
     page_size = int(payload["pageSize"])
     rows: list[dict[str, Any]] = []
     first_response: dict[str, Any] | None = None
@@ -428,6 +467,7 @@ def fetch_api(
         "fetchedAt": datetime.now(SHANGHAI_TZ).isoformat(timespec="seconds"),
         "pages": page_number,
         "count": len(rows),
+        "asTypes": list(as_types),
     }
     return first_response
 
@@ -438,8 +478,10 @@ def fetch_api_via_chrome(
     start_date: str,
     end_date: str,
     login_timeout: int = 600,
+    *,
+    as_types: tuple[str, ...] = (),
 ) -> dict[str, Any]:
-    payload = build_payload(start_date, end_date)
+    payload = build_payload(start_date, end_date, as_types=as_types)
     page_size = int(payload["pageSize"])
     rows: list[dict[str, Any]] = []
     first_response: dict[str, Any] | None = None
@@ -504,6 +546,7 @@ def fetch_api_via_chrome(
         "pages": page_number,
         "count": len(rows),
         "source": "chrome",
+        "asTypes": list(as_types),
     }
     return first_response
 
@@ -513,6 +556,34 @@ def api_rows(document: dict[str, Any]) -> list[dict[str, Any]]:
     if not isinstance(rows, list):
         raise ValueError("API JSON does not contain data.list")
     return rows
+
+
+def populate_calculated_return_rate(
+    rows: list[dict[str, Any]],
+    output_field: str,
+    minimum_sales: int = 50,
+) -> int:
+    populated = 0
+    for row in rows:
+        row[output_field] = None
+        try:
+            sales_count = Decimal(str(row["itemCount"]))
+            refund_money = Decimal(str(row["rawRefundMoney"]))
+            sale_money = Decimal(str(row["saleMoney"]))
+        except (KeyError, InvalidOperation, TypeError, ValueError):
+            continue
+        if not all(
+            value.is_finite()
+            for value in (sales_count, refund_money, sale_money)
+        ):
+            continue
+        if sales_count < minimum_sales or sale_money <= 0:
+            continue
+        percentage = refund_money / sale_money * 100
+        rounded = percentage.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        row[output_field] = f"{rounded:.2f}%"
+        populated += 1
+    return populated
 
 
 def populate_derived_return_rate(rows: list[dict[str, Any]]) -> int:
@@ -992,7 +1063,8 @@ def prepare_monthly_update(
     workbook: Path,
     cycle: SyncCycle,
     actual_rows: list[dict[str, Any]],
-    return_rows: list[dict[str, Any]],
+    before_return_rows: list[dict[str, Any]],
+    overall_return_rows: list[dict[str, Any]],
     aliases: dict[str, str],
     critical_skus: set[str] | None,
 ) -> PreparedMonthlyUpdate:
@@ -1009,7 +1081,8 @@ def prepare_monthly_update(
             shared_strings,
             cycle,
             actual_rows,
-            return_rows,
+            before_return_rows,
+            overall_return_rows,
             aliases,
             critical_skus or set(),
             choose_candidate,
@@ -1060,12 +1133,16 @@ def _load_or_fetch_window(
     company_id: str,
     start: str,
     end: str,
+    *,
+    as_types: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     if json_path is not None:
         return load_json(json_path)
     if cookie is None:
         raise RuntimeError("ERP Cookie is required")
-    return fetch_api(cookie, company_id, start, end)
+    return fetch_api(
+        cookie, company_id, start, end, as_types=as_types
+    )
 
 
 def _previous_snapshot(
@@ -1087,6 +1164,11 @@ def _monthly_report_rows(
 ) -> list[dict[str, Any]]:
     if field == "actual":
         keys = ("row", "sheet_sku", "sheet_name", "actual_status", "old_actual", "new_actual")
+    elif field == "before_return":
+        keys = (
+            "row", "sheet_sku", "sheet_name", "before_return_status",
+            "old_before_return", "new_before_return",
+        )
     else:
         keys = ("row", "sheet_sku", "sheet_name", "return_status", "old_return", "new_return")
     return [{key: row.get(key) for key in keys} for row in rows]
@@ -1100,8 +1182,14 @@ def run_monthly_sync(args: argparse.Namespace, run_date: date | None = None) -> 
         raise SystemExit("Master workbook is required; set workbook in config.json or pass --workbook")
     if not workbook.exists():
         raise SystemExit(f"Master workbook not found: {workbook}")
-    if (args.actual_json is None) != (args.return_json is None):
-        raise SystemExit("Offline mode requires both --actual-json and --return-json")
+    before_return_json = getattr(args, "before_return_json", None)
+    offline_inputs = (args.actual_json, before_return_json, args.return_json)
+    if any(path is not None for path in offline_inputs) and not all(
+        path is not None for path in offline_inputs
+    ):
+        raise SystemExit(
+            "Offline mode requires --actual-json, --before-return-json and --return-json"
+        )
     browser_login = bool(getattr(args, "browser_login", False)) and sys.platform == "darwin"
 
     actual_start, actual_end = cycle.actual_window.iso()
@@ -1116,7 +1204,8 @@ def run_monthly_sync(args: argparse.Namespace, run_date: date | None = None) -> 
 
     if args.actual_json is not None:
         actual_document = load_json(args.actual_json)
-        return_document = load_json(args.return_json)
+        before_return_document = load_json(before_return_json)
+        overall_return_document = load_json(args.return_json)
     elif browser_login:
         print("正在打开ERP专用Chrome登录窗口……", flush=True)
         with ChromeErpSession() as browser_session:
@@ -1125,49 +1214,95 @@ def run_monthly_sync(args: argparse.Namespace, run_date: date | None = None) -> 
                 args.company_id,
                 actual_start,
                 actual_end,
+                as_types=(),
             )
-            return_document = fetch_api_via_chrome(
+            before_return_document = fetch_api_via_chrome(
                 browser_session,
                 args.company_id,
                 return_start,
                 return_end,
+                as_types=BEFORE_RETURN_PROFILE.as_types,
+            )
+            overall_return_document = fetch_api_via_chrome(
+                browser_session,
+                args.company_id,
+                return_start,
+                return_end,
+                as_types=OVERALL_RETURN_PROFILE.as_types,
             )
     else:
         actual_document = _load_or_fetch_window(
-            None, cookie, args.company_id, actual_start, actual_end
+            None, cookie, args.company_id, actual_start, actual_end,
+            as_types=(),
         )
-        return_document = _load_or_fetch_window(
-            None, cookie, args.company_id, return_start, return_end
+        before_return_document = _load_or_fetch_window(
+            None, cookie, args.company_id, return_start, return_end,
+            as_types=BEFORE_RETURN_PROFILE.as_types,
+        )
+        overall_return_document = _load_or_fetch_window(
+            None, cookie, args.company_id, return_start, return_end,
+            as_types=OVERALL_RETURN_PROFILE.as_types,
         )
 
     snapshot_dir = Path(args.snapshot_dir)
     snapshot_dir.mkdir(parents=True, exist_ok=True)
     actual_snapshot = snapshot_dir / f"actual_{actual_start}_{actual_end}.json"
-    return_snapshot = snapshot_dir / f"return_{return_start}_{return_end}.json"
+    before_return_snapshot = (
+        snapshot_dir / f"return_before_{return_start}_{return_end}.json"
+    )
+    overall_return_snapshot = (
+        snapshot_dir / f"return_overall_{return_start}_{return_end}.json"
+    )
     previous_actual = _previous_snapshot(snapshot_dir, "actual", actual_snapshot)
-    previous_return = _previous_snapshot(snapshot_dir, "return", return_snapshot)
+    previous_before_return = _previous_snapshot(
+        snapshot_dir, "return_before", before_return_snapshot
+    )
+    previous_overall_return = _previous_snapshot(
+        snapshot_dir, "return_overall", overall_return_snapshot
+    )
     save_json(actual_snapshot, actual_document)
-    save_json(return_snapshot, return_document)
+    save_json(before_return_snapshot, before_return_document)
+    save_json(overall_return_snapshot, overall_return_document)
 
     actual_rows = api_rows(actual_document)
-    return_rows = api_rows(return_document)
-    derived_return_rates = populate_derived_return_rate(return_rows)
+    before_return_rows = api_rows(before_return_document)
+    overall_return_rows = api_rows(overall_return_document)
+    calculated_before_rates = populate_calculated_return_rate(
+        before_return_rows, BEFORE_RETURN_FIELD
+    )
+    calculated_overall_rates = populate_calculated_return_rate(
+        overall_return_rows, OVERALL_RETURN_FIELD
+    )
     aliases = load_aliases(args.aliases)
     critical_skus = load_target_skus(args.skus_file)
     prepared = prepare_monthly_update(
         workbook,
         cycle,
         actual_rows,
-        return_rows,
+        before_return_rows,
+        overall_return_rows,
         aliases,
         critical_skus,
     )
 
     report_dir = Path(args.report_dir) / cycle.node_date.isoformat()
     actual_fields = ["row", "sheet_sku", "sheet_name", "actual_status", "old_actual", "new_actual"]
+    before_return_fields = [
+        "row", "sheet_sku", "sheet_name", "before_return_status",
+        "old_before_return", "new_before_return",
+    ]
     return_fields = ["row", "sheet_sku", "sheet_name", "return_status", "old_return", "new_return"]
     write_csv(report_dir / "actual_changes.csv", _monthly_report_rows(prepared.rows, "actual"), actual_fields)
-    write_csv(report_dir / "return_changes.csv", _monthly_report_rows(prepared.rows, "return"), return_fields)
+    write_csv(
+        report_dir / "before_return_changes.csv",
+        _monthly_report_rows(prepared.rows, "before_return"),
+        before_return_fields,
+    )
+    write_csv(
+        report_dir / "overall_return_changes.csv",
+        _monthly_report_rows(prepared.rows, "return"),
+        return_fields,
+    )
     write_csv(
         report_dir / "manual_review.csv",
         list(prepared.review),
@@ -1176,19 +1311,63 @@ def run_monthly_sync(args: argparse.Namespace, run_date: date | None = None) -> 
     write_csv(
         report_dir / "critical_skus.csv",
         list(prepared.critical_results),
-        ["sku", "sheet_exists", "actual_status", "return_status", "actual_candidate_sku", "actual_candidate_title", "return_candidate_sku", "return_candidate_title", "passed"],
+        [
+            "sku", "sheet_exists", "actual_status", "before_return_status",
+            "return_status", "actual_candidate_sku", "actual_candidate_title",
+            "before_return_candidate_sku", "before_return_candidate_title",
+            "return_candidate_sku", "return_candidate_title", "passed",
+        ],
     )
     actual_differences = (
         compare_api_snapshots(api_rows(previous_actual), actual_rows)
         if previous_actual is not None else []
     )
-    return_differences = (
-        compare_api_snapshots(api_rows(previous_return), return_rows)
-        if previous_return is not None else []
+    before_return_differences = (
+        compare_api_snapshots(
+            api_rows(previous_before_return), before_return_rows
+        )
+        if previous_before_return is not None else []
+    )
+    overall_return_differences = (
+        compare_api_snapshots(
+            api_rows(previous_overall_return), overall_return_rows
+        )
+        if previous_overall_return is not None else []
     )
     difference_fields = ["status", "itemOuterId", "title", "field", "old", "new"]
     write_csv(report_dir / "api_actual_changes.csv", flatten_api_differences(actual_differences), difference_fields)
-    write_csv(report_dir / "api_return_changes.csv", flatten_api_differences(return_differences), difference_fields)
+    write_csv(
+        report_dir / "api_before_return_changes.csv",
+        flatten_api_differences(before_return_differences),
+        difference_fields,
+    )
+    write_csv(
+        report_dir / "api_overall_return_changes.csv",
+        flatten_api_differences(overall_return_differences),
+        difference_fields,
+    )
+
+    def profile_summary(
+        profile: ReturnRateProfile,
+        rows: list[dict[str, Any]],
+        calculated: int,
+    ) -> dict[str, Any]:
+        below_threshold = 0
+        for row in rows:
+            try:
+                count = Decimal(str(row["itemCount"]))
+            except (KeyError, InvalidOperation, TypeError, ValueError):
+                continue
+            if count.is_finite() and count < 50:
+                below_threshold += 1
+        return {
+            "enabled": profile.enabled,
+            "asTypes": list(profile.as_types),
+            "apiCount": len(rows),
+            "calculatedCount": calculated,
+            "belowThresholdCount": below_threshold,
+            "blankOrInvalidCount": len(rows) - calculated,
+        }
 
     summary: dict[str, Any] = {
         "runDate": run_date.isoformat(),
@@ -1197,8 +1376,26 @@ def run_monthly_sync(args: argparse.Namespace, run_date: date | None = None) -> 
         "actualWindow": [actual_start, actual_end],
         "returnWindow": [return_start, return_end],
         "actualApiCount": len(actual_rows),
-        "returnApiCount": len(return_rows),
-        "derivedReturnRates": derived_return_rates,
+        "returnProfiles": {
+            "before_shipment": profile_summary(
+                BEFORE_RETURN_PROFILE,
+                before_return_rows,
+                calculated_before_rates,
+            ),
+            "after_shipment": {
+                "enabled": False,
+                "asTypes": [],
+                "apiCount": 0,
+                "calculatedCount": 0,
+                "belowThresholdCount": 0,
+                "blankOrInvalidCount": 0,
+            },
+            "overall": profile_summary(
+                OVERALL_RETURN_PROFILE,
+                overall_return_rows,
+                calculated_overall_rates,
+            ),
+        },
         "insertedMonthColumn": prepared.inserted,
         "formulaCount": prepared.formula_count,
         "manualReviewRows": len(prepared.review),
@@ -1238,7 +1435,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workbook", type=Path, help="Master XLSX workbook updated after validation")
     parser.add_argument("--snapshot-dir", type=Path)
     parser.add_argument("--actual-json", type=Path, help="Offline ERP response for the actual-quantity window")
-    parser.add_argument("--return-json", type=Path, help="Offline ERP response for the return-rate window")
+    parser.add_argument(
+        "--before-return-json",
+        type=Path,
+        help="Offline ERP response for the before-shipment return-rate window",
+    )
+    parser.add_argument(
+        "--return-json",
+        type=Path,
+        help="Offline ERP response for the overall return-rate window",
+    )
     parser.add_argument("--company-id")
     parser.add_argument("--cookie-env")
     parser.add_argument(
@@ -1269,10 +1475,12 @@ RUN_DEFAULTS: dict[str, Any] = {
     "dry_run": False,
 }
 CONFIG_PATH_FIELDS = {
-    "workbook", "snapshot_dir", "actual_json", "return_json", "aliases", "skus_file", "report_dir",
+    "workbook", "snapshot_dir", "actual_json", "before_return_json",
+    "return_json", "aliases", "skus_file", "report_dir",
 }
 CONFIG_FIELDS = {
-    "workbook", "snapshot_dir", "actual_json", "return_json", "company_id", "cookie_env",
+    "workbook", "snapshot_dir", "actual_json", "before_return_json",
+    "return_json", "company_id", "cookie_env",
     "browser_login", "aliases", "skus_file", "report_dir", "dry_run",
 }
 LEGACY_CONFIG_FIELDS = {

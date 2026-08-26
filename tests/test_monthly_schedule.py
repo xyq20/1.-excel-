@@ -70,12 +70,28 @@ class HeaderAndFormulaTests(unittest.TestCase):
         cycle = resolve_sync_cycle(date(2026, 9, 8))
 
         self.assertEqual(actual_header(cycle), "8月实发")
+        self.assertEqual(
+            return_header(cycle, "发货前退货率"),
+            "发货前退货率（7.15-8.15）",
+        )
+        self.assertEqual(
+            return_header(cycle, "发货后退货率"),
+            "发货后退货率（7.15-8.15）",
+        )
         self.assertEqual(return_header(cycle), "退货率（7.15-8.15）")
 
     def test_fifteenth_node_headers_describe_the_resolved_windows(self):
         cycle = resolve_sync_cycle(date(2026, 9, 15))
 
         self.assertEqual(actual_header(cycle), "9月实发（9.15）")
+        self.assertEqual(
+            return_header(cycle, "发货前退货率"),
+            "发货前退货率（8.1-8.31）",
+        )
+        self.assertEqual(
+            return_header(cycle, "发货后退货率"),
+            "发货后退货率（8.1-8.31）",
+        )
         self.assertEqual(return_header(cycle), "退货率（8.1-8.31）")
 
     def test_peer_formula_uses_leap_february_day_count(self):
