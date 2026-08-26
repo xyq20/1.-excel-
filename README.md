@@ -22,7 +22,7 @@
 python .\erp_excel_sync.py --config .\config.json
 ```
 
-Mac 首次双击运行时会提示粘贴 ERP 登录 Cookie，然后安全保存到 macOS 钥匙串；后续运行会自动读取，无需重复输入。Cookie 过期时，在“钥匙串访问”中删除名为 `ERP Excel Sync` 的项目，再次运行即会提示输入新 Cookie。Windows 或命令行未设置 `ERP_COOKIE` 时，Python 程序仍会提示输入。
+Mac 会自动打开一个独立的 ERP Chrome 窗口。首次或ERP登录过期时，只需在网页中正常登录；程序会自动检测登录成功并从该浏览器会话请求两组ERP数据，不再要求复制或粘贴 Cookie。专用 Chrome 资料保存在用户的 `Library/Application Support/ERP Excel Sync/ChromeProfile` 中，后续运行会复用登录状态。
 
 ## 匹配、校验与保存
 

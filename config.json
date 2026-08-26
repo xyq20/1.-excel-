@@ -1,8 +1,9 @@
 {
-  "_说明": "只维护 workbook 路径；日期窗口由运行日期自动计算。target_skus.txt 仅做关键货号校验，不限制全表更新。",
+  "_说明": "只维护 workbook 路径；Mac 会自动打开 Chrome 使用网页登录会话，无需粘贴 Cookie。日期窗口自动计算，target_skus.txt 仅做关键货号校验。",
   "workbook": "outputs/26年8月分级总表_API同步.xlsx",
   "company_id": "111873",
   "cookie_env": "ERP_COOKIE",
+  "browser_login": true,
   "skus_file": "target_skus.txt",
   "aliases": "sku_aliases.json",
   "snapshot_dir": "snapshots",

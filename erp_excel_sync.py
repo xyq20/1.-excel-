@@ -12,6 +12,7 @@ import re
 import struct
 import sys
 import tempfile
+import time as time_module
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlencode
@@ -20,6 +21,7 @@ import zlib
 import zipfile
 from xml.etree import ElementTree as ET
 
+from chrome_erp_session import BrowserLoginRequired, ChromeErpSession
 from monthly_schedule import SyncCycle, resolve_sync_cycle
 from xlsx_monthly import (
     apply_monthly_values,
@@ -425,6 +427,82 @@ def fetch_api(
         "fetchedAt": datetime.now(SHANGHAI_TZ).isoformat(timespec="seconds"),
         "pages": page_number,
         "count": len(rows),
+    }
+    return first_response
+
+
+def fetch_api_via_chrome(
+    session: ChromeErpSession,
+    company_id: str,
+    start_date: str,
+    end_date: str,
+    login_timeout: int = 600,
+) -> dict[str, Any]:
+    payload = build_payload(start_date, end_date)
+    page_size = int(payload["pageSize"])
+    rows: list[dict[str, Any]] = []
+    first_response: dict[str, Any] | None = None
+    page_number = 1
+    login_deadline = time_module.monotonic() + login_timeout
+    login_message_shown = False
+    while True:
+        payload["pageNo"] = str(page_number)
+        headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Companyid": company_id,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Module-Path": "/report/sale_multidimension_next/",
+            "Trackid": f"trackid{int(datetime.now().timestamp() * 1000)}_chrome",
+        }
+        try:
+            result = session.post_form_json(
+                API_URL,
+                headers,
+                urlencode(payload),
+            )
+        except BrowserLoginRequired:
+            if time_module.monotonic() >= login_deadline:
+                raise RuntimeError("Timed out waiting for ERP browser login")
+            if not login_message_shown:
+                print(
+                    "ERP登录窗口已打开。请在Chrome中完成登录，登录成功后程序会自动继续。",
+                    flush=True,
+                )
+                login_message_shown = True
+            time_module.sleep(2)
+            continue
+        if result.get("result") != 1 and not result.get("suc"):
+            message = result.get("message") or result.get("msg") or "unknown API error"
+            if any(keyword in str(message) for keyword in ("登录", "登陆", "未认证", "session")):
+                if time_module.monotonic() >= login_deadline:
+                    raise RuntimeError("Timed out waiting for ERP browser login")
+                if not login_message_shown:
+                    print(
+                        "ERP登录窗口已打开。请在Chrome中完成登录，登录成功后程序会自动继续。",
+                        flush=True,
+                    )
+                    login_message_shown = True
+                time_module.sleep(2)
+                continue
+            raise RuntimeError(f"ERP API rejected the request: {message}")
+        if first_response is None:
+            first_response = result
+        batch = result.get("data", {}).get("list", [])
+        if not isinstance(batch, list):
+            raise RuntimeError("ERP API response does not contain data.list")
+        rows.extend(batch)
+        if len(batch) < page_size:
+            break
+        page_number += 1
+    assert first_response is not None
+    first_response.setdefault("data", {})["list"] = rows
+    first_response["syncMeta"] = {
+        "startDate": start_date,
+        "endDate": end_date,
+        "fetchedAt": datetime.now(SHANGHAI_TZ).isoformat(timespec="seconds"),
+        "pages": page_number,
+        "count": len(rows),
+        "source": "chrome",
     }
     return first_response
 
@@ -999,23 +1077,43 @@ def run_monthly_sync(args: argparse.Namespace, run_date: date | None = None) -> 
         raise SystemExit(f"Master workbook not found: {workbook}")
     if (args.actual_json is None) != (args.return_json is None):
         raise SystemExit("Offline mode requires both --actual-json and --return-json")
+    browser_login = bool(getattr(args, "browser_login", False)) and sys.platform == "darwin"
 
     actual_start, actual_end = cycle.actual_window.iso()
     return_start, return_end = cycle.return_window.iso()
     cookie: str | None = None
-    if args.actual_json is None:
+    if args.actual_json is None and not browser_login:
         cookie = os.environ.get(args.cookie_env)
         if not cookie:
             cookie = getpass.getpass(f"{args.cookie_env} is not set; paste ERP Cookie: ")
         if not cookie.strip():
             raise SystemExit("ERP Cookie is required")
 
-    actual_document = _load_or_fetch_window(
-        args.actual_json, cookie, args.company_id, actual_start, actual_end
-    )
-    return_document = _load_or_fetch_window(
-        args.return_json, cookie, args.company_id, return_start, return_end
-    )
+    if args.actual_json is not None:
+        actual_document = load_json(args.actual_json)
+        return_document = load_json(args.return_json)
+    elif browser_login:
+        print("正在打开ERP专用Chrome登录窗口……", flush=True)
+        with ChromeErpSession() as browser_session:
+            actual_document = fetch_api_via_chrome(
+                browser_session,
+                args.company_id,
+                actual_start,
+                actual_end,
+            )
+            return_document = fetch_api_via_chrome(
+                browser_session,
+                args.company_id,
+                return_start,
+                return_end,
+            )
+    else:
+        actual_document = _load_or_fetch_window(
+            None, cookie, args.company_id, actual_start, actual_end
+        )
+        return_document = _load_or_fetch_window(
+            None, cookie, args.company_id, return_start, return_end
+        )
 
     snapshot_dir = Path(args.snapshot_dir)
     snapshot_dir.mkdir(parents=True, exist_ok=True)
@@ -1116,6 +1214,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--return-json", type=Path, help="Offline ERP response for the return-rate window")
     parser.add_argument("--company-id")
     parser.add_argument("--cookie-env")
+    parser.add_argument(
+        "--browser-login",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Open a persistent Chrome ERP profile and use its signed-in API session",
+    )
     parser.add_argument("--aliases", type=Path)
     parser.add_argument("--skus-file", type=Path, help="Critical SKU validation list")
     parser.add_argument("--report-dir", type=Path)
@@ -1131,6 +1235,7 @@ def build_parser() -> argparse.ArgumentParser:
 RUN_DEFAULTS: dict[str, Any] = {
     "company_id": "111873",
     "cookie_env": "ERP_COOKIE",
+    "browser_login": True,
     "snapshot_dir": Path("snapshots"),
     "aliases": Path("sku_aliases.json"),
     "report_dir": Path("reports"),
@@ -1141,7 +1246,7 @@ CONFIG_PATH_FIELDS = {
 }
 CONFIG_FIELDS = {
     "workbook", "snapshot_dir", "actual_json", "return_json", "company_id", "cookie_env",
-    "aliases", "skus_file", "report_dir", "dry_run",
+    "browser_login", "aliases", "skus_file", "report_dir", "dry_run",
 }
 LEGACY_CONFIG_FIELDS = {
     "input", "output", "start", "end", "start_date", "end_date",
