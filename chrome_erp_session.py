@@ -295,7 +295,12 @@ class ChromeErpSession:
             raise RuntimeError("Chrome returned no ERP response")
         wrapper = json.loads(value)
         if wrapper.get("fetchError"):
-            raise RuntimeError(f"Chrome ERP request failed: {wrapper['fetchError']}")
+            fetch_error = str(wrapper["fetchError"])
+            if "Failed to fetch" in fetch_error:
+                raise BrowserLoginRequired(
+                    "ERP page is still completing its login navigation"
+                )
+            raise RuntimeError(f"Chrome ERP request failed: {fetch_error}")
         content_type = str(wrapper.get("contentType", "")).casefold()
         response_url = str(wrapper.get("url", "")).casefold()
         if (
@@ -314,7 +319,7 @@ class ChromeErpSession:
         if self._client is None:
             return
         try:
-            if self._started_browser:
+            if self._started_browser and exc_type is None:
                 self._client.call("Browser.close")
         except (OSError, RuntimeError):
             pass
