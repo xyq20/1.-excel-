@@ -483,8 +483,67 @@ class MonthlyValueWriteTests(unittest.TestCase):
 
         self.assertIn(b'<c r="Y2" s="177"><v>10</v></c>', result.sheet_xml)
         self.assertIn(b'<c r="AA2" s="219"><v>0.25</v></c>', result.sheet_xml)
-        self.assertEqual(result.rows[0]["actual_status"], "invalid_value")
+        self.assertEqual(result.rows[0]["actual_status"], "invalid_actual")
         self.assertEqual(result.rows[0]["return_status"], "invalid_value")
+
+    def test_actual_count_accepts_nonnegative_integral_forms(self):
+        for value, expected in (
+            (12, "12"),
+            ("12", "12"),
+            ("12.0", "12"),
+            (9007199254740993, "9007199254740993"),
+        ):
+            with self.subTest(value=value):
+                result = self._apply(
+                    self._sheet(), resolve_sync_cycle(date(2026, 8, 15)),
+                    [{
+                        "itemOuterId": "A-1",
+                        "title": "Alpha",
+                        "actualSysConsignCount": value,
+                    }],
+                    [],
+                )
+
+                self.assertIn(
+                    f'<c r="Y2" s="177"><v>{expected}</v></c>'.encode("ascii"),
+                    result.sheet_xml,
+                )
+                self.assertEqual(result.rows[0]["actual_status"], "exact")
+
+    def test_invalid_actual_counts_retain_old_value_and_fail_critical(self):
+        for value in (
+            12.9,
+            "12.0000000000000001",
+            -1,
+            "NaN",
+            "Inf",
+            "not-a-number",
+        ):
+            with self.subTest(value=value):
+                result = self._apply(
+                    self._sheet(), resolve_sync_cycle(date(2026, 8, 15)),
+                    [{
+                        "itemOuterId": "A-1",
+                        "title": "Alpha",
+                        "actualSysConsignCount": value,
+                    }],
+                    [{
+                        "itemOuterId": "A-1",
+                        "title": "Alpha",
+                        RETURN_RATE_FIELD: "10%",
+                    }],
+                    critical_skus={"A-1"},
+                )
+
+                self.assertIn(b'<c r="Y2" s="177"><v>10</v></c>', result.sheet_xml)
+                self.assertEqual(result.rows[0]["actual_status"], "invalid_actual")
+                self.assertTrue(any(
+                    item["field"] == "actual"
+                    and item["status"] == "invalid_actual"
+                    and item["row"] == 2
+                    for item in result.review
+                ))
+                self.assertFalse(result.critical_results[0]["passed"])
 
     def test_alias_matches_both_windows_and_writes(self):
         cycle = resolve_sync_cycle(date(2026, 8, 15))
@@ -605,6 +664,94 @@ class MonthlyValueWriteTests(unittest.TestCase):
             result.sheet_xml,
         )
         self.assertNotRegex(result.sheet_xml, rb'<c r="(?:X|Z)[234]"[^>]*><f>.*?</f><v>')
+
+    def test_missing_formula_cells_inherit_column_styles_and_extend_change_cf(self):
+        rows = [
+            b'<row r="550"><c r="E550" t="inlineStr"><is><t>SKU-550</t></is></c>'
+            b'<c r="F550" t="inlineStr"><is><t>Name 550</t></is></c>'
+            b'<c r="X550" s="139"><f>W550/31*14</f></c>'
+            b'<c r="Y550" s="177"><v>10</v></c>'
+            b'<c r="Z550" s="178"><f>TEXT(Y550-X550,&quot;old&quot;)</f></c>'
+            b'<c r="AA550" s="219"><v>0.1</v></c></row>',
+            b'<row r="553"><c r="X553" s="139"><f>W553/31*14</f></c>'
+            b'<c r="Z553" s="178"><f>TEXT(Y553-X553,&quot;old&quot;)</f></c></row>'
+        ]
+        for row_number in range(554, 562):
+            formula_cells = b""
+            if row_number != 555:
+                formula_cells += (
+                    f'<c r="X{row_number}" s="139"><f>stale</f><v>1</v></c>'
+                ).encode("ascii")
+            if row_number not in {554, 555}:
+                formula_cells += (
+                    f'<c r="Z{row_number}" s="178"><f>stale</f><v>1</v></c>'
+                ).encode("ascii")
+            rows.append(
+                (
+                    f'<row r="{row_number}"><c r="E{row_number}" t="inlineStr">'
+                    f'<is><t>SKU-{row_number}</t></is></c>'
+                    f'<c r="F{row_number}" t="inlineStr"><is><t>Name {row_number}</t></is></c>'
+                ).encode("ascii")
+                + formula_cells
+                + (
+                    f'<c r="Y{row_number}" s="177"><v>10</v></c>'
+                    f'<c r="AA{row_number}" s="219"><v>0.1</v></c></row>'
+                ).encode("ascii")
+            )
+        source = workbook_sheet(
+            [
+                ("W", "7月实发"),
+                ("X", "同期销量"),
+                ("Y", "8月实发（8.15）"),
+                ("Z", "变化情况"),
+                ("AA", "退货率（7.1-7.31）"),
+            ],
+            rows=b"".join(rows),
+            extras=(
+                b'<conditionalFormatting sqref="Z2:Z549 Z551:Z553"><cfRule type="containsText" '
+                b'operator="containsText" text="increase"><formula>NOT(ISERROR('
+                b'SEARCH(&quot;increase&quot;,Z2)))</formula></cfRule></conditionalFormatting>'
+                b'<conditionalFormatting sqref="Z550"><cfRule type="containsText" '
+                b'operator="containsText" text="increase"><formula>NOT(ISERROR('
+                b'SEARCH(&quot;increase&quot;,Z550)))</formula></cfRule></conditionalFormatting>'
+            ),
+        )
+        cycle = resolve_sync_cycle(date(2026, 8, 15))
+
+        first = apply_monthly_values(
+            source, [], cycle, [], [], aliases={}, critical_skus=set(),
+            matcher=choose_candidate,
+        )
+        second = apply_monthly_values(
+            first.sheet_xml, [], cycle, [], [], aliases={}, critical_skus=set(),
+            matcher=choose_candidate,
+        )
+
+        self.assertIn(b'<c r="Z554" s="178"><f>TEXT(', first.sheet_xml)
+        self.assertIn(b'<c r="X555" s="139"><f>W555/31*14</f></c>', first.sheet_xml)
+        self.assertIn(b'<c r="Z555" s="178"><f>TEXT(', first.sheet_xml)
+        contains_text_cf = re.search(
+            rb'<conditionalFormatting sqref="([^"]+)"><cfRule type="containsText"',
+            first.sheet_xml,
+        )
+        self.assertIsNotNone(contains_text_cf)
+        self.assertEqual(contains_text_cf.group(1), b"Z2:Z549 Z551:Z561")
+        change_sqrefs = re.findall(
+            rb'<conditionalFormatting sqref="([^"]+)"><cfRule type="containsText"',
+            first.sheet_xml,
+        )
+        coverage = {row: 0 for row in (550, *range(554, 562))}
+        for sqref in change_sqrefs:
+            for token in sqref.decode().split():
+                matched = re.fullmatch(r"Z(\d+)(?::Z(\d+))?", token)
+                if matched:
+                    start = int(matched.group(1))
+                    end = int(matched.group(2) or matched.group(1))
+                    for row in coverage:
+                        if start <= row <= end:
+                            coverage[row] += 1
+        self.assertEqual(set(coverage.values()), {1})
+        self.assertEqual(second.sheet_xml, first.sheet_xml)
 
     def test_first_node_renames_staged_headers_without_insertion(self):
         cycle = resolve_sync_cycle(date(2026, 9, 1))

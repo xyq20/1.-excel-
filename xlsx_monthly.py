@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 import html
 import math
 import re
@@ -543,13 +545,15 @@ def _set_cell_formula(
     col: str,
     row_number: int,
     formula: str,
+    default_style: str | None = None,
 ) -> bytes:
     existing = next(
         (cell for cell in CELL_RE.finditer(row) if _cell_col(cell) == col),
         None,
     )
     if existing is None:
-        opening = f'<c r="{col}{row_number}"'.encode("ascii")
+        style = "" if default_style is None else f' s="{default_style}"'
+        opening = f'<c r="{col}{row_number}"{style}'.encode("ascii")
     else:
         opening = existing.group(0).split(b">", 1)[0].rstrip(b"/")
         opening = re.sub(rb'\s+t="[^"]*"', b"", opening)
@@ -557,6 +561,140 @@ def _set_cell_formula(
     encoded = html.escape(formula, quote=False).encode("utf-8")
     cell = opening + b"><f>" + encoded + b"</f></c>"
     return _insert_or_replace_cell(row, col, row_number, cell)
+
+
+def _formula_column_style(sheet_xml: bytes, col: str) -> str | None:
+    styles: list[str] = []
+    formula_tag = rb'(?:[A-Za-z_][\w.-]*:)?(?:formula[12]?|f)'
+    for cell in CELL_RE.finditer(sheet_xml):
+        if _cell_col(cell) != col:
+            continue
+        if not re.search(rb'<'+ formula_tag + rb'\b', cell.group("body") or b""):
+            continue
+        style = re.search(rb'\bs="(\d+)"', cell.group(0).split(b">", 1)[0])
+        if style:
+            styles.append(style.group(1).decode("ascii"))
+    return Counter(styles).most_common(1)[0][0] if styles else None
+
+
+def _extend_change_conditional_formatting(
+    sheet_xml: bytes,
+    change_col: str,
+    formula_rows: set[int],
+) -> bytes:
+    if not formula_rows:
+        return sheet_xml
+    wrapper_re = re.compile(
+        rb'(?P<open><(?:[A-Za-z_][\w.-]*:)?conditionalFormatting\b[^>]*>)'
+        rb'(?P<body>.*?</(?:[A-Za-z_][\w.-]*:)?conditionalFormatting>)',
+        re.S,
+    )
+    contains_text_re = re.compile(
+        rb'<(?:[A-Za-z_][\w.-]*:)?cfRule\b(?=[^>]*\btype="containsText")[^>]*>'
+    )
+    target_pattern = re.compile(
+        rf"^\$?{re.escape(change_col)}\$?(\d+)"
+        rf"(?::\$?{re.escape(change_col)}\$?(\d+))?$"
+    )
+    candidates_by_rule: dict[
+        tuple[str, ...], list[tuple[int, int, list[tuple[int, int]]]]
+    ] = {}
+    for candidate in wrapper_re.finditer(sheet_xml):
+        rule = contains_text_re.search(candidate.group("body"))
+        if rule is None:
+            continue
+        sqref_match = re.search(rb'\bsqref="([^"]*)"', candidate.group("open"))
+        if sqref_match is None:
+            continue
+        intervals = []
+        for token in html.unescape(
+            sqref_match.group(1).decode("utf-8", "ignore")
+        ).split():
+            target = target_pattern.fullmatch(token)
+            if target:
+                start = int(target.group(1))
+                end = int(target.group(2) or start)
+                intervals.append((min(start, end), max(start, end)))
+        if not intervals:
+            continue
+        attrs = _tag_attributes(rule.group(0))
+        signature = tuple(
+            attrs.get(key, "")
+            for key in ("type", "dxfId", "operator", "text")
+        )
+        coverage = sum(end - start + 1 for start, end in intervals)
+        candidates_by_rule.setdefault(signature, []).append(
+            (coverage, candidate.start(), intervals)
+        )
+    selected_starts: set[int] = set()
+    covered_elsewhere: dict[int, set[int]] = {}
+    for candidates in candidates_by_rule.values():
+        _coverage, selected_start, _intervals = max(
+            candidates, key=lambda item: item[0]
+        )
+        selected_starts.add(selected_start)
+        sibling_intervals = [
+            interval
+            for _size, start, intervals in candidates
+            if start != selected_start
+            for interval in intervals
+        ]
+        covered_elsewhere[selected_start] = {
+            row
+            for row in formula_rows
+            if any(start <= row <= end for start, end in sibling_intervals)
+        }
+
+    def extend_wrapper(match: re.Match[bytes]) -> bytes:
+        if match.start() not in selected_starts:
+            return match.group(0)
+        if not contains_text_re.search(match.group("body")):
+            return match.group(0)
+        opening = match.group("open")
+        sqref_match = re.search(rb'\bsqref="([^"]*)"', opening)
+        if sqref_match is None:
+            return match.group(0)
+        sqref = html.unescape(sqref_match.group(1).decode("utf-8", "ignore"))
+        tokens = sqref.split()
+        other_tokens: list[str] = []
+        intervals: list[tuple[int, int]] = []
+        for token in tokens:
+            target = target_pattern.fullmatch(token)
+            if target is None:
+                other_tokens.append(token)
+                continue
+            start = int(target.group(1))
+            end = int(target.group(2) or start)
+            intervals.append((min(start, end), max(start, end)))
+        if not intervals:
+            return match.group(0)
+        intervals.extend(
+            (row, row)
+            for row in formula_rows
+            if row not in covered_elsewhere.get(match.start(), set())
+        )
+        merged: list[list[int]] = []
+        for start, end in sorted(intervals):
+            if merged and start <= merged[-1][1] + 1:
+                merged[-1][1] = max(merged[-1][1], end)
+            else:
+                merged.append([start, end])
+        target_tokens = [
+            f"{change_col}{start}"
+            if start == end
+            else f"{change_col}{start}:{change_col}{end}"
+            for start, end in merged
+        ]
+        updated_sqref = " ".join(other_tokens + target_tokens)
+        escaped = html.escape(updated_sqref, quote=True).encode("utf-8")
+        updated_opening = (
+            opening[: sqref_match.start(1)]
+            + escaped
+            + opening[sqref_match.end(1) :]
+        )
+        return updated_opening + match.group("body")
+
+    return wrapper_re.sub(extend_wrapper, sheet_xml)
 
 
 def apply_monthly_values(
@@ -579,6 +717,13 @@ def apply_monthly_values(
     review: list[dict[str, Any]] = []
     row_matches: dict[str, list[dict[str, Any]]] = {}
     formula_count = 0
+    formula_rows: set[int] = set()
+    peer_formula_style = _formula_column_style(
+        insertion.sheet_xml, layout.peer_col
+    )
+    change_formula_style = _formula_column_style(
+        insertion.sheet_xml, layout.change_col
+    )
 
     def update_row(match: re.Match[bytes]) -> bytes:
         nonlocal formula_count
@@ -621,14 +766,22 @@ def apply_monthly_values(
                 raw_actual = actual_match.candidate["actualSysConsignCount"]
                 if raw_actual is None or str(raw_actual).strip() == "":
                     raise KeyError("actualSysConsignCount")
-                parsed_actual = float(raw_actual)
-                if not math.isfinite(parsed_actual):
-                    raise ValueError("actual count must be finite")
+                if isinstance(raw_actual, bool):
+                    raise ValueError("actual count cannot be boolean")
+                parsed_actual = Decimal(str(raw_actual).strip())
+                if (
+                    not parsed_actual.is_finite()
+                    or parsed_actual < 0
+                    or parsed_actual != parsed_actual.to_integral_value()
+                ):
+                    raise ValueError(
+                        "actual count must be a finite nonnegative integer"
+                    )
                 new_actual = str(int(parsed_actual))
             except KeyError:
                 actual_status = "missing_value"
-            except (TypeError, ValueError):
-                actual_status = "invalid_value"
+            except (InvalidOperation, TypeError, ValueError):
+                actual_status = "invalid_actual"
             else:
                 actual_auto_write = True
                 row = _set_cell_number(row, layout.actual_col, row_number, new_actual)
@@ -676,14 +829,17 @@ def apply_monthly_values(
             layout.peer_col,
             row_number,
             peer_formula(layout.previous_col, row_number, cycle),
+            default_style=peer_formula_style,
         )
         row = _set_cell_formula(
             row,
             layout.change_col,
             row_number,
             change_formula(layout.actual_col, layout.peer_col, row_number, cycle),
+            default_style=change_formula_style,
         )
         formula_count += 2
+        formula_rows.add(row_number)
 
         report_row = {
             "row": row_number,
@@ -708,6 +864,9 @@ def apply_monthly_values(
         return row
 
     patched = ROW_RE.sub(update_row, insertion.sheet_xml)
+    patched = _extend_change_conditional_formatting(
+        patched, layout.change_col, formula_rows
+    )
     critical_results: list[dict[str, Any]] = []
     for sku in sorted({_normalize_sku(raw_sku) for raw_sku in critical_skus}):
         matches = row_matches.get(sku, [])

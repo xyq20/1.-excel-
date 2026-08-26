@@ -27,6 +27,8 @@ WORKSHEET_PATH = "xl/worksheets/sheet1.xml"
 MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 RETURN_RATE_FIELD = "customA1ED4F3EEFEF30DBB8E9A9A4823B79A3"
 COMPARE_FIELDS = ("actualSysConsignCount", RETURN_RATE_FIELD)
+DUPLICATE_NAME_MIN_SCORE = 0.60
+DUPLICATE_NAME_MIN_MARGIN = 0.15
 CELL_RE = re.compile(
     rb'(<c\s+[^>]*?\br="(?P<col2>[A-Z]+)(?P<row2>\d+)"[^>]*/>|'
     rb'<c\s+[^>]*?\br="(?P<col>[A-Z]+)(?P<row>\d+)"[^>]*>(?P<body>.*?)</c>)',
@@ -103,7 +105,14 @@ def _select_by_name(name: str, candidates: list[dict[str, Any]]) -> tuple[dict[s
         key=lambda item: item[0],
         reverse=True,
     )
-    if ranked and ranked[0][0] > 0 and (len(ranked) == 1 or ranked[0][0] > ranked[1][0]):
+    if (
+        ranked
+        and ranked[0][0] >= DUPLICATE_NAME_MIN_SCORE
+        and (
+            len(ranked) == 1
+            or ranked[0][0] - ranked[1][0] >= DUPLICATE_NAME_MIN_MARGIN
+        )
+    ):
         return ranked[0][1], ranked[0][0]
     return None, ranked[0][0] if ranked else 0.0
 

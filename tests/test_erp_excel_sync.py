@@ -138,6 +138,36 @@ class DateWindowTests(unittest.TestCase):
 
 
 class CandidateMatchingTests(unittest.TestCase):
+    def test_duplicate_exact_sku_with_negligible_name_similarity_is_ambiguous(self):
+        result = choose_candidate(
+            "SKU-1",
+            "alpha",
+            [
+                {"itemOuterId": "SKU-1", "title": "zzzzza"},
+                {"itemOuterId": "SKU-1", "title": "qqqq"},
+            ],
+            aliases={},
+        )
+
+        self.assertEqual(result.status, "ambiguous")
+        self.assertFalse(result.auto_write)
+        self.assertIsNone(result.candidate)
+
+    def test_duplicate_exact_sku_with_close_name_scores_is_ambiguous(self):
+        result = choose_candidate(
+            "SKU-1",
+            "alpha",
+            [
+                {"itemOuterId": "SKU-1", "title": "alpa"},
+                {"itemOuterId": "SKU-1", "title": "alphi"},
+            ],
+            aliases={},
+        )
+
+        self.assertEqual(result.status, "ambiguous")
+        self.assertFalse(result.auto_write)
+        self.assertIsNone(result.candidate)
+
     def test_independent_windows_can_choose_different_records_for_the_same_sheet_row(self):
         actual = choose_candidate(
             "A-1", "Alpha",
