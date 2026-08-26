@@ -612,7 +612,11 @@ def apply_monthly_values(
         actual_auto_write = False
         return_auto_write = False
 
-        if actual_match.auto_write and actual_match.candidate is not None:
+        if (
+            actual_match.auto_write
+            and actual_match.status in {"exact", "alias"}
+            and actual_match.candidate is not None
+        ):
             try:
                 raw_actual = actual_match.candidate["actualSysConsignCount"]
                 if raw_actual is None or str(raw_actual).strip() == "":
@@ -637,7 +641,11 @@ def apply_monthly_values(
                 status=actual_status,
             ))
 
-        if return_match.auto_write and return_match.candidate is not None:
+        if (
+            return_match.auto_write
+            and return_match.status in {"exact", "alias"}
+            and return_match.candidate is not None
+        ):
             try:
                 raw_return = return_match.candidate[
                     "customA1ED4F3EEFEF30DBB8E9A9A4823B79A3"

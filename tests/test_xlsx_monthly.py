@@ -548,6 +548,36 @@ class MonthlyValueWriteTests(unittest.TestCase):
         self.assertFalse(result.critical_results[0]["passed"])
         self.assertEqual(len(result.critical_failures), 1)
 
+    def test_review_status_blocks_writes_even_when_matcher_sets_auto_write(self):
+        def unsafe_matcher(sheet_sku, sheet_name, rows, aliases):
+            return MatchResult("review", rows[0], 0.8, True, ("sku",))
+
+        candidate = {
+            "itemOuterId": "A-1",
+            "title": "Alpha",
+            "actualSysConsignCount": 999,
+            RETURN_RATE_FIELD: "99%",
+        }
+        result = apply_monthly_values(
+            self._sheet(),
+            ["A-1", "Alpha", "B-2", "Beta", "Alias SKU", "Gamma"],
+            resolve_sync_cycle(date(2026, 8, 15)),
+            [candidate],
+            [candidate],
+            aliases={},
+            critical_skus={"A-1"},
+            matcher=unsafe_matcher,
+        )
+
+        self.assertIn(b'<c r="Y2" s="177"><v>10</v></c>', result.sheet_xml)
+        self.assertIn(b'<c r="AA2" s="219"><v>0.25</v></c>', result.sheet_xml)
+        self.assertEqual(
+            {(item["field"], item["status"]) for item in result.review if item["row"] == 2},
+            {("actual", "review"), ("return", "review")},
+        )
+        self.assertFalse(result.critical_results[0]["passed"])
+        self.assertEqual(len(result.critical_failures), 1)
+
     def test_critical_reports_are_sorted_after_normalization(self):
         result = self._apply(
             self._sheet(), resolve_sync_cycle(date(2026, 8, 15)), [], [],
