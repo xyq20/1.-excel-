@@ -215,6 +215,7 @@ class ChromeErpSession:
     def __init__(self) -> None:
         self._client: _CdpWebSocket | None = None
         self._started_browser = False
+        self._keep_open = False
 
     def __enter__(self) -> ChromeErpSession:
         try:
@@ -297,7 +298,12 @@ class ChromeErpSession:
             time.sleep(0.25)
         else:
             raise RuntimeError("ERP login page did not finish opening in Chrome")
+        self._client.call("Page.bringToFront")
         return self
+
+    def keep_open(self) -> None:
+        """Detach after use without closing the dedicated ERP browser."""
+        self._keep_open = True
 
     def post_form_json(
         self,
@@ -367,7 +373,7 @@ class ChromeErpSession:
         if self._client is None:
             return
         try:
-            if exc_type is None:
+            if exc_type is None and not self._keep_open:
                 self._client.call("Browser.close")
         except (OSError, RuntimeError):
             pass

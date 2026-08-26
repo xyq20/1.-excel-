@@ -89,6 +89,17 @@ class ChromeErpSessionTests(unittest.TestCase):
         self.assertFalse(any(method == "Browser.close" for method, _ in client.calls))
         self.assertTrue(client.closed)
 
+    def test_view_mode_leaves_browser_open(self):
+        session = ChromeErpSession()
+        client = _FakeClient({})
+        session._client = client
+        session.keep_open()
+
+        session.__exit__(None, None, None)
+
+        self.assertFalse(any(method == "Browser.close" for method, _ in client.calls))
+        self.assertTrue(client.closed)
+
 
 if __name__ == "__main__":
     unittest.main()
