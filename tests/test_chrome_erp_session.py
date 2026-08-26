@@ -1,8 +1,15 @@
 import json
+from pathlib import Path
+import tempfile
 import unittest
 from urllib.parse import urlparse
 
-from chrome_erp_session import BrowserLoginRequired, ChromeErpSession, ERP_HOME
+from chrome_erp_session import (
+    BrowserLoginRequired,
+    ChromeErpSession,
+    ERP_HOME,
+    _enable_session_restore,
+)
 from erp_excel_sync import API_URL
 
 
@@ -21,6 +28,17 @@ class _FakeClient:
 
 
 class ChromeErpSessionTests(unittest.TestCase):
+    def test_dedicated_profile_restores_last_session(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profile = Path(temp_dir)
+            _enable_session_restore(profile)
+
+            preferences = json.loads(
+                (profile / "Default" / "Preferences").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(preferences["session"]["restore_on_startup"], 1)
+
     def test_browser_page_and_api_use_the_same_erp_origin(self):
         self.assertEqual(urlparse(ERP_HOME).netloc, "erp.superboss.cc")
         self.assertEqual(urlparse(API_URL).netloc, urlparse(ERP_HOME).netloc)
@@ -36,13 +54,13 @@ class ChromeErpSessionTests(unittest.TestCase):
         with self.assertRaises(BrowserLoginRequired):
             session.post_form_json("https://example.test", {}, "")
 
-    def test_browser_stays_open_when_sync_raises(self):
+    def test_browser_stays_open_after_every_sync_result(self):
         session = ChromeErpSession()
         client = _FakeClient({})
         session._client = client
         session._started_browser = True
 
-        session.__exit__(RuntimeError, RuntimeError("failed"), None)
+        session.__exit__(None, None, None)
 
         self.assertFalse(any(method == "Browser.close" for method, _ in client.calls))
         self.assertTrue(client.closed)

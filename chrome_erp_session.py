@@ -166,6 +166,32 @@ def _debug_json(path: str, method: str = "GET") -> Any:
         return json.loads(response.read().decode("utf-8"))
 
 
+def _enable_session_restore(profile: Path) -> None:
+    preferences_path = profile / "Default" / "Preferences"
+    preferences_path.parent.mkdir(parents=True, exist_ok=True)
+    document: dict[str, Any] = {}
+    if preferences_path.exists():
+        try:
+            loaded = json.loads(preferences_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            loaded = {}
+        if isinstance(loaded, dict):
+            document = loaded
+    session = document.setdefault("session", {})
+    if not isinstance(session, dict):
+        session = {}
+        document["session"] = session
+    if session.get("restore_on_startup") == 1:
+        return
+    session["restore_on_startup"] = 1
+    temporary = preferences_path.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(document, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    os.replace(temporary, preferences_path)
+
+
 class ChromeErpSession:
     def __init__(self) -> None:
         self._client: _CdpWebSocket | None = None
@@ -184,7 +210,7 @@ class ChromeErpSession:
                 / "ERP Excel Sync"
                 / "ChromeProfile"
             )
-            profile.mkdir(parents=True, exist_ok=True)
+            _enable_session_restore(profile)
             subprocess.Popen(
                 [
                     str(CHROME_EXECUTABLE),
@@ -193,6 +219,7 @@ class ChromeErpSession:
                     "--remote-allow-origins=*",
                     "--no-first-run",
                     "--no-default-browser-check",
+                    "--restore-last-session",
                     ERP_HOME,
                 ],
                 stdout=subprocess.DEVNULL,
@@ -318,10 +345,4 @@ class ChromeErpSession:
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
         if self._client is None:
             return
-        try:
-            if self._started_browser and exc_type is None:
-                self._client.call("Browser.close")
-        except (OSError, RuntimeError):
-            pass
-        finally:
-            self._client.close()
+        self._client.close()

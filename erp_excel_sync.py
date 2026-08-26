@@ -2,6 +2,7 @@ import argparse
 import csv
 from datetime import date, datetime, time, timedelta, timezone
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from difflib import SequenceMatcher
 import getpass
 import json
@@ -512,6 +513,30 @@ def api_rows(document: dict[str, Any]) -> list[dict[str, Any]]:
     if not isinstance(rows, list):
         raise ValueError("API JSON does not contain data.list")
     return rows
+
+
+def populate_derived_return_rate(rows: list[dict[str, Any]]) -> int:
+    populated = 0
+    for row in rows:
+        if row.get(RETURN_RATE_FIELD) not in (None, ""):
+            continue
+        try:
+            refund_money = Decimal(str(row["rawRefundMoney"]))
+            sale_money = Decimal(str(row["saleMoney"]))
+        except (KeyError, InvalidOperation, TypeError, ValueError):
+            continue
+        if not refund_money.is_finite() or not sale_money.is_finite():
+            continue
+        if sale_money == 0:
+            if refund_money != 0:
+                continue
+            percentage = Decimal("0")
+        else:
+            percentage = refund_money / sale_money * 100
+        rounded = percentage.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        row[RETURN_RATE_FIELD] = f"{rounded:.2f}%"
+        populated += 1
+    return populated
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -1126,6 +1151,7 @@ def run_monthly_sync(args: argparse.Namespace, run_date: date | None = None) -> 
 
     actual_rows = api_rows(actual_document)
     return_rows = api_rows(return_document)
+    derived_return_rates = populate_derived_return_rate(return_rows)
     aliases = load_aliases(args.aliases)
     critical_skus = load_target_skus(args.skus_file)
     prepared = prepare_monthly_update(
@@ -1172,6 +1198,7 @@ def run_monthly_sync(args: argparse.Namespace, run_date: date | None = None) -> 
         "returnWindow": [return_start, return_end],
         "actualApiCount": len(actual_rows),
         "returnApiCount": len(return_rows),
+        "derivedReturnRates": derived_return_rates,
         "insertedMonthColumn": prepared.inserted,
         "formulaCount": prepared.formula_count,
         "manualReviewRows": len(prepared.review),

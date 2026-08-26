@@ -16,6 +16,7 @@ from erp_excel_sync import (
     compare_api_snapshots,
     date_window_ms,
     parse_runtime_args,
+    populate_derived_return_rate,
     run_monthly_sync,
     set_cell_value,
     sync_sheet_xml,
@@ -310,6 +311,39 @@ class CandidateMatchingTests(unittest.TestCase):
 
 
 class ReviewTests(unittest.TestCase):
+    def test_derives_custom_return_rate_from_refund_and_sale_money(self):
+        rows = [{"rawRefundMoney": 69331.11, "saleMoney": 172911.16}]
+
+        populated = populate_derived_return_rate(rows)
+
+        self.assertEqual(populated, 1)
+        self.assertEqual(
+            rows[0]["customA1ED4F3EEFEF30DBB8E9A9A4823B79A3"],
+            "40.10%",
+        )
+
+    def test_zero_money_derives_zero_percent_and_existing_value_is_preserved(self):
+        rows = [
+            {"rawRefundMoney": 0, "saleMoney": 0},
+            {
+                "rawRefundMoney": 100,
+                "saleMoney": 200,
+                "customA1ED4F3EEFEF30DBB8E9A9A4823B79A3": "12.34%",
+            },
+        ]
+
+        populated = populate_derived_return_rate(rows)
+
+        self.assertEqual(populated, 1)
+        self.assertEqual(
+            rows[0]["customA1ED4F3EEFEF30DBB8E9A9A4823B79A3"],
+            "0.00%",
+        )
+        self.assertEqual(
+            rows[1]["customA1ED4F3EEFEF30DBB8E9A9A4823B79A3"],
+            "12.34%",
+        )
+
     def test_lists_only_api_columns_that_changed(self):
         old = {
             "itemOuterId": "7057",

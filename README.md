@@ -22,12 +22,13 @@
 python .\erp_excel_sync.py --config .\config.json
 ```
 
-Mac 会自动打开一个独立的 ERP Chrome 窗口。首次或ERP登录过期时，只需在网页中正常登录；程序会自动检测登录成功并从该浏览器会话请求两组ERP数据，不再要求复制或粘贴 Cookie。专用 Chrome 资料保存在用户的 `Library/Application Support/ERP Excel Sync/ChromeProfile` 中，后续运行会复用登录状态。
+Mac 会自动打开一个独立的 ERP Chrome 窗口。首次或ERP登录过期时，只需在网页中正常登录；程序会自动检测登录成功并从该浏览器会话请求两组ERP数据，不再要求复制或粘贴 Cookie。同步完成后专用 Chrome 会保持打开，后续运行直接复用登录会话；不需要时可由用户手动关闭。
 
 ## 匹配、校验与保存
 
 - 表内所有有货号的款式都会更新；`target_skus.txt` 只是关键货号校验清单，不是过滤器。
 - 精确货号和 `sku_aliases.json` 中已确认的别名自动写入；模糊、歧义或缺失数据进入人工审核报告。
+- 浏览器API未直接返回历史自定义退货率字段时，按ERP原自定义公式 `rawRefundMoney ÷ saleMoney` 计算，保留两位小数。
 - 任一关键货号未同时匹配实发和退货率时，只产生报告，不替换主文件。
 - 更新前先在主文件同目录生成临时候选文件，通过 ZIP CRC、工作表、行数、图片、表头和公式校验后才原子替换。
 - 原主文件保留为同名 `.xlsx.bak`，只保留最近一份备份。
