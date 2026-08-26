@@ -54,13 +54,23 @@ class ChromeErpSessionTests(unittest.TestCase):
         with self.assertRaises(BrowserLoginRequired):
             session.post_form_json("https://example.test", {}, "")
 
-    def test_browser_stays_open_after_every_sync_result(self):
+    def test_browser_closes_after_successful_sync(self):
         session = ChromeErpSession()
         client = _FakeClient({})
         session._client = client
         session._started_browser = True
 
         session.__exit__(None, None, None)
+
+        self.assertTrue(any(method == "Browser.close" for method, _ in client.calls))
+        self.assertTrue(client.closed)
+
+    def test_browser_stays_open_when_sync_raises(self):
+        session = ChromeErpSession()
+        client = _FakeClient({})
+        session._client = client
+
+        session.__exit__(RuntimeError, RuntimeError("failed"), None)
 
         self.assertFalse(any(method == "Browser.close" for method, _ in client.calls))
         self.assertTrue(client.closed)

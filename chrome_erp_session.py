@@ -345,4 +345,10 @@ class ChromeErpSession:
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
         if self._client is None:
             return
-        self._client.close()
+        try:
+            if exc_type is None:
+                self._client.call("Browser.close")
+        except (OSError, RuntimeError):
+            pass
+        finally:
+            self._client.close()
