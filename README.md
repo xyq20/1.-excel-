@@ -1,96 +1,54 @@
-# ERP 实发数量与退货率同步
+# ERP 月度实发数量与退货率同步
 
-`erp_excel_sync.py` 从快麦 ERP 的“销售主题报表/按款”接口抓取数据，将：
+`erp_excel_sync.py` 根据运行日期自动选择每月1日或15日节点，分别请求ERP的实发数量和退货率，全量更新“分级总表”。脚本直接补丁 XLSX 内部 XML，不需要打开 WPS，并保留大量图片和媒体文件。
 
-- `actualSysConsignCount` 写入工作表 Y 列（8月实发）
-- `customA1ED4F3EEFEF30DBB8E9A9A4823B79A3` 写入 AA 列（退货率）
+## 日期与列滚动
 
-脚本直接修改 XLSX 内部 XML，只重新压缩目标工作表，适合当前约 283MB、包含大量图片的文件。无需打开 WPS。
+- 每月1—14日运行：归属本月1日节点。实发取上月全月；退货率取上上月15日至上月15日。不插列，并把 `8月实发（8.15）` 改为 `8月实发`。
+- 每月15日至月底运行：归属本月15日节点。实发取本月1—14日；退货率取上月全月。首次插入本月列，标题如 `9月实发（9.15）`。
+- 展示顺序始终为：`上月实发 | 同期销量 | 本月实发 | 变化情况 | 退货率`。旧月份实发列保留但隐藏。
+- 同期销量为“上月实发 ÷ 上月天数 × 14”；变化情况公式随列位置和月份自动更新。
+- 同一节点可重复运行：只刷新数据、公式和报告，不重复新增列。
 
-## 一键运行
+## 使用
 
-1. 打开 `config.json`，修改最上面的日期：
-
-```json
-"start_date": "2026-08-01",
-"end_date": "2026-08-24"
-```
-
-需要时也可修改 `input`、`output`、`skus_file` 等运行参数。配置中的相对路径以 `config.json` 所在目录为基准。
-
-2. 双击 `run_sync.bat`。
-
-脚本会读取 `config.json` 并开始同步，窗口会保留执行结果。没有设置 `ERP_COOKIE` 时，会提示粘贴浏览器登录后的 Cookie。
-
-当前配置的重要参数：
-
-- `input`：源 Excel 文件。
-- `output`：生成的 Excel 文件，源文件不会被覆盖。
-- `start_date` / `end_date`：订单创建时间范围，包含当天全天。
-- `skus_file`：需要同步的货号清单；设为 `null` 时处理表内全部货号。
-- `dry_run`：设为 `true` 时只抓取和生成审核报告，不生成 Excel。
-
-## 命令行运行
-
-使用 Python 3.10+，仅依赖标准库。先设置浏览器登录后的 Cookie：
-
-```powershell
-$env:ERP_COOKIE = '从浏览器请求中复制的 Cookie'
-```
-
-然后运行：
-
-```powershell
-python .\erp_excel_sync.py `
-  --input "$env:USERPROFILE\Desktop\26年8月分级总表.xlsx" `
-  --output ".\outputs\26年8月分级总表_API同步.xlsx" `
-  --start 2026-08-01 `
-  --end 2026-08-24 `
-  --skus-file .\target_skus.txt
-```
-
-脚本默认读取同目录的 `config.json`。命令行参数优先级更高，可临时覆盖配置而不修改文件：
-
-```powershell
-python .\erp_excel_sync.py --start 2026-08-01 --end 2026-08-25
-```
-
-也可以指定另一份配置：
+1. 确认 `config.json` 中的 `workbook` 指向要长期维护的主工作簿。相对路径以配置文件所在目录为基准。
+2. 关闭该工作簿的 WPS/Excel 编辑窗口，避免文件被锁定。
+3. Windows 上双击 `run_sync.bat`；或用 Python 3.10+ 运行：
 
 ```powershell
 python .\erp_excel_sync.py --config .\config.json
 ```
 
-未设置 `ERP_COOKIE` 时，脚本会安全提示输入。关闭网页不会中断脚本；Cookie 过期后需要重新登录并复制。
+未设置 `ERP_COOKIE` 时，脚本会提示粘贴ERP登录 Cookie。Cookie过期后重新登录并复制即可。
 
-日期筛选使用订单“创建时间”。即使开始/结束日期不变，订单后续实发、退款和售后状态变化仍会让历史区间的接口结果发生变化，因此每次运行都会保存快照并生成字段差异清单。
+## 匹配、校验与保存
 
-## 匹配与审核
+- 表内所有有货号的款式都会更新；`target_skus.txt` 只是关键货号校验清单，不是过滤器。
+- 精确货号和 `sku_aliases.json` 中已确认的别名自动写入；模糊、歧义或缺失数据进入人工审核报告。
+- 任一关键货号未同时匹配实发和退货率时，只产生报告，不替换主文件。
+- 更新前先在主文件同目录生成临时候选文件，通过 ZIP CRC、工作表、行数、图片、表头和公式校验后才原子替换。
+- 原主文件保留为同名 `.xlsx.bak`，只保留最近一份备份。
 
-- 精确货号、`sku_aliases.json` 中已确认的别名：自动写入。
-- 只有轻微差异的模糊匹配：默认不写入，列入 `reports/manual_review.csv`。
-- 同一货号有多条记录时，使用商品名称消歧；仍不确定则人工审核。
-- `reports/sync_changes.csv`：Excel 原值、新值和发生变化的列。
-- `reports/api_changes.csv`：本次 API 与上次快照发生变化的字段。
-- `reports/summary.json`：执行汇总。
+ERP快照保存在 `snapshots/`，报告保存在 `reports/节点日期/`。
 
-审核确认后，将映射加入 `sku_aliases.json`，下次即可自动写入。
+## 安全预览与离线测试
 
-只检查、不生成 Excel：
+只生成快照和报告，不替换 Excel：
 
 ```powershell
-python .\erp_excel_sync.py --input "原表.xlsx" --start 2026-08-01 --end 2026-08-24 --dry-run
+python .\erp_excel_sync.py --config .\config.json --dry-run
 ```
 
-使用已保存的接口响应进行离线测试：
+使用两份已保存的ERP响应离线验证：
 
 ```powershell
-python .\erp_excel_sync.py --input "原表.xlsx" --output "结果.xlsx" `
-  --start 2026-08-01 --end 2026-08-24 --api-json .\erp_dimensions.json
+python .\erp_excel_sync.py --config .\config.json `
+  --actual-json .\actual.json --return-json .\return.json --dry-run
 ```
 
 ## 测试
 
 ```powershell
-python -m unittest tests.test_erp_excel_sync -v
+python -m unittest discover -s tests -v
 ```

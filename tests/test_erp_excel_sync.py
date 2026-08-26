@@ -4,7 +4,10 @@ import os
 import shutil
 import subprocess
 import tempfile
+from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 from erp_excel_sync import (
     build_payload,
@@ -13,6 +16,7 @@ from erp_excel_sync import (
     compare_api_snapshots,
     date_window_ms,
     parse_runtime_args,
+    run_monthly_sync,
     set_cell_value,
     sync_sheet_xml,
 )
@@ -55,30 +59,25 @@ class RuntimeConfigTests(unittest.TestCase):
             config_path = Path(temp_dir) / "config.json"
             config_path.write_text(
                 json.dumps({
-                    "_说明": {"start_date": "开始日期"},
-                    "start_date": "2026-08-01",
-                    "end_date": "2026-08-24",
-                    "input": "source.xlsx",
-                    "output": "result.xlsx",
+                    "_说明": {"workbook": "主工作簿"},
+                    "workbook": "master.xlsx",
                 }, ensure_ascii=False),
                 encoding="utf-8",
             )
 
             args = parse_runtime_args(["--config", str(config_path)])
 
-            self.assertEqual(args.start, "2026-08-01")
-            self.assertEqual(args.end, "2026-08-24")
+            self.assertEqual(args.workbook, Path(temp_dir).resolve() / "master.xlsx")
 
-    def test_loads_run_parameters_from_config_and_resolves_relative_paths(self):
+    def test_loads_master_workbook_and_runtime_directories(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_dir = Path(temp_dir)
             config_path = config_dir / "config.json"
             config_path.write_text(
                 json.dumps({
-                    "input": "source.xlsx",
-                    "output": "outputs/result.xlsx",
-                    "start_date": "2026-08-01",
-                    "end_date": "2026-08-24",
+                    "workbook": "outputs/master.xlsx",
+                    "snapshot_dir": "snapshots",
+                    "report_dir": "reports",
                     "skus_file": "target_skus.txt",
                     "dry_run": False,
                 }),
@@ -88,14 +87,13 @@ class RuntimeConfigTests(unittest.TestCase):
             args = parse_runtime_args(["--config", str(config_path)])
 
             resolved_dir = config_dir.resolve()
-            self.assertEqual(args.input, resolved_dir / "source.xlsx")
-            self.assertEqual(args.output, resolved_dir / "outputs/result.xlsx")
+            self.assertEqual(args.workbook, resolved_dir / "outputs/master.xlsx")
+            self.assertEqual(args.snapshot_dir, resolved_dir / "snapshots")
+            self.assertEqual(args.report_dir, resolved_dir / "reports")
             self.assertEqual(args.skus_file, resolved_dir / "target_skus.txt")
-            self.assertEqual(args.start, "2026-08-01")
-            self.assertEqual(args.end, "2026-08-24")
             self.assertFalse(args.dry_run)
 
-    def test_command_line_dates_override_config_dates(self):
+    def test_rejects_legacy_one_window_configuration(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.json"
             config_path.write_text(
@@ -108,14 +106,8 @@ class RuntimeConfigTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            args = parse_runtime_args([
-                "--config", str(config_path),
-                "--start", "2026-08-05",
-                "--end", "2026-08-25",
-            ])
-
-            self.assertEqual(args.start, "2026-08-05")
-            self.assertEqual(args.end, "2026-08-25")
+            with self.assertRaisesRegex(SystemExit, "legacy configuration"):
+                parse_runtime_args(["--config", str(config_path)])
 
 
 class DateWindowTests(unittest.TestCase):
@@ -135,6 +127,96 @@ class DateWindowTests(unittest.TestCase):
         self.assertEqual(payload["sysStatus"], "created")
         self.assertEqual(payload["tradeTypes"], "")
         self.assertEqual(payload["asStatus"], "9,2,12")
+
+
+class MonthlyOrchestrationTests(unittest.TestCase):
+    def _args(self, root: Path) -> SimpleNamespace:
+        workbook = root / "master.xlsx"
+        workbook.write_bytes(b"master")
+        (root / "aliases.json").write_text("{}", encoding="utf-8")
+        (root / "critical.txt").write_text("", encoding="utf-8")
+        return SimpleNamespace(
+            workbook=workbook,
+            snapshot_dir=root / "snapshots",
+            report_dir=root / "reports",
+            actual_json=None,
+            return_json=None,
+            company_id="111873",
+            cookie_env="ERP_COOKIE",
+            aliases=root / "aliases.json",
+            skus_file=root / "critical.txt",
+            dry_run=False,
+        )
+
+    @mock.patch("erp_excel_sync.atomic_replace_master")
+    @mock.patch("erp_excel_sync.validate_workbook")
+    @mock.patch("erp_excel_sync.prepare_monthly_update")
+    @mock.patch("erp_excel_sync.fetch_api")
+    def test_fetches_independent_windows_and_writes_reports_before_blocking(
+        self, fetch_api_mock, prepare_mock, validate_mock, replace_mock
+    ):
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.dict(
+            os.environ, {"ERP_COOKIE": "cookie"}
+        ):
+            root = Path(temp_dir)
+            args = self._args(root)
+            fetch_api_mock.side_effect = [
+                {"data": {"list": [{"itemOuterId": "A"}]}},
+                {"data": {"list": [{"itemOuterId": "B"}]}},
+            ]
+            prepare_mock.return_value = SimpleNamespace(
+                inserted=True,
+                formula_count=2,
+                rows=(),
+                review=(),
+                critical_results=({"sku": "7057", "passed": False},),
+                critical_failures=({"sku": "7057", "passed": False},),
+                replacements={},
+            )
+
+            result = run_monthly_sync(args, run_date=date(2026, 9, 16))
+
+            self.assertEqual(result, 2)
+            self.assertEqual(
+                [call.args[2:] for call in fetch_api_mock.call_args_list],
+                [("2026-09-01", "2026-09-14"), ("2026-08-01", "2026-08-31")],
+            )
+            self.assertTrue((root / "reports" / "2026-09-15" / "summary.json").exists())
+            self.assertTrue((root / "reports" / "2026-09-15" / "critical_skus.csv").exists())
+            validate_mock.assert_not_called()
+            replace_mock.assert_not_called()
+
+    @mock.patch("erp_excel_sync.atomic_replace_master")
+    @mock.patch("erp_excel_sync.validate_workbook")
+    @mock.patch("erp_excel_sync.fast_patch_zip")
+    @mock.patch("erp_excel_sync.prepare_monthly_update")
+    def test_dry_run_never_creates_or_replaces_a_candidate(
+        self, prepare_mock, patch_mock, validate_mock, replace_mock
+    ):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            args = self._args(root)
+            args.dry_run = True
+            actual = root / "actual.json"
+            returns = root / "return.json"
+            actual.write_text('{"data":{"list":[]}}', encoding="utf-8")
+            returns.write_text('{"data":{"list":[]}}', encoding="utf-8")
+            args.actual_json = actual
+            args.return_json = returns
+            prepare_mock.return_value = SimpleNamespace(
+                inserted=False,
+                formula_count=0,
+                rows=(),
+                review=(),
+                critical_results=(),
+                critical_failures=(),
+                replacements={},
+            )
+
+            self.assertEqual(run_monthly_sync(args, run_date=date(2026, 9, 8)), 0)
+            patch_mock.assert_not_called()
+            validate_mock.assert_not_called()
+            replace_mock.assert_not_called()
 
 
 class CandidateMatchingTests(unittest.TestCase):

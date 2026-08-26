@@ -1,12 +1,13 @@
 import argparse
 import csv
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 import getpass
 import json
 import os
 from pathlib import Path
+import posixpath
 import re
 import struct
 import sys
@@ -19,8 +20,15 @@ import zlib
 import zipfile
 from xml.etree import ElementTree as ET
 
-from monthly_schedule import SyncCycle
-from xlsx_monthly import column_number, validate_monthly_sheet
+from monthly_schedule import SyncCycle, resolve_sync_cycle
+from xlsx_monthly import (
+    apply_monthly_values,
+    column_number,
+    shift_drawing_anchors,
+    shift_qualified_worksheet_formulas,
+    update_workbook_xml,
+    validate_monthly_sheet,
+)
 
 
 SHANGHAI_TZ = timezone(timedelta(hours=8))
@@ -63,6 +71,17 @@ class MatchResult:
     confidence: float
     auto_write: bool
     differences: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class PreparedMonthlyUpdate:
+    inserted: bool
+    formula_count: int
+    rows: tuple[dict[str, Any], ...]
+    review: tuple[dict[str, Any], ...]
+    critical_results: tuple[dict[str, Any], ...]
+    critical_failures: tuple[dict[str, Any], ...]
+    replacements: dict[str, bytes]
 
 
 def date_window_ms(start_date: str, end_date: str) -> tuple[int, int]:
@@ -839,20 +858,266 @@ def flatten_api_differences(differences: list[dict[str, Any]]) -> list[dict[str,
     return rows
 
 
+def _drawing_parts_for_main_sheet(
+    archive: zipfile.ZipFile,
+) -> tuple[str, ...]:
+    rels_path = "xl/worksheets/_rels/sheet1.xml.rels"
+    if rels_path not in archive.namelist():
+        return ()
+    root = ET.fromstring(archive.read(rels_path))
+    drawing_paths: list[str] = []
+    for relationship in root.iter():
+        if not relationship.attrib.get("Type", "").endswith("/drawing"):
+            continue
+        if relationship.attrib.get("TargetMode", "").casefold() == "external":
+            continue
+        target = relationship.attrib.get("Target", "")
+        if not target:
+            continue
+        if target.startswith("/"):
+            resolved = target.lstrip("/")
+        else:
+            resolved = posixpath.normpath(
+                posixpath.join(posixpath.dirname(WORKSHEET_PATH), target)
+            )
+        if resolved in archive.namelist():
+            drawing_paths.append(resolved)
+    return tuple(dict.fromkeys(drawing_paths))
+
+
+def prepare_monthly_update(
+    workbook: Path,
+    cycle: SyncCycle,
+    actual_rows: list[dict[str, Any]],
+    return_rows: list[dict[str, Any]],
+    aliases: dict[str, str],
+    critical_skus: set[str] | None,
+) -> PreparedMonthlyUpdate:
+    with zipfile.ZipFile(workbook, "r") as archive:
+        names = archive.namelist()
+        sheet_xml = archive.read(WORKSHEET_PATH)
+        shared_strings = (
+            read_shared_strings(archive)
+            if "xl/sharedStrings.xml" in names
+            else []
+        )
+        result = apply_monthly_values(
+            sheet_xml,
+            shared_strings,
+            cycle,
+            actual_rows,
+            return_rows,
+            aliases,
+            critical_skus or set(),
+            choose_candidate,
+        )
+
+        replacements: dict[str, bytes] = {WORKSHEET_PATH: result.sheet_xml}
+        insert_before = result.layout.previous_col if result.inserted else None
+        workbook_xml = update_workbook_xml(
+            archive.read("xl/workbook.xml"), insert_before
+        )
+        replacements["xl/workbook.xml"] = workbook_xml
+
+        if result.inserted:
+            for name in names:
+                if (
+                    name.startswith("xl/worksheets/")
+                    and name.endswith(".xml")
+                    and name != WORKSHEET_PATH
+                ):
+                    original = archive.read(name)
+                    shifted = shift_qualified_worksheet_formulas(
+                        original, result.layout.previous_col
+                    )
+                    if shifted != original:
+                        replacements[name] = shifted
+            for name in _drawing_parts_for_main_sheet(archive):
+                original = archive.read(name)
+                shifted = shift_drawing_anchors(
+                    original, result.layout.previous_col
+                )
+                if shifted != original:
+                    replacements[name] = shifted
+
+    return PreparedMonthlyUpdate(
+        inserted=result.inserted,
+        formula_count=result.formula_count,
+        rows=result.rows,
+        review=result.review,
+        critical_results=result.critical_results,
+        critical_failures=result.critical_failures,
+        replacements=replacements,
+    )
+
+
+def _load_or_fetch_window(
+    json_path: Path | None,
+    cookie: str | None,
+    company_id: str,
+    start: str,
+    end: str,
+) -> dict[str, Any]:
+    if json_path is not None:
+        return load_json(json_path)
+    if cookie is None:
+        raise RuntimeError("ERP Cookie is required")
+    return fetch_api(cookie, company_id, start, end)
+
+
+def _previous_snapshot(
+    snapshot_dir: Path,
+    prefix: str,
+    current: Path,
+) -> dict[str, Any] | None:
+    candidates = sorted(
+        (path for path in snapshot_dir.glob(f"{prefix}_*.json") if path != current),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    return load_json(candidates[0]) if candidates else None
+
+
+def _monthly_report_rows(
+    rows: tuple[dict[str, Any], ...],
+    field: str,
+) -> list[dict[str, Any]]:
+    if field == "actual":
+        keys = ("row", "sheet_sku", "sheet_name", "actual_status", "old_actual", "new_actual")
+    else:
+        keys = ("row", "sheet_sku", "sheet_name", "return_status", "old_return", "new_return")
+    return [{key: row.get(key) for key in keys} for row in rows]
+
+
+def run_monthly_sync(args: argparse.Namespace, run_date: date | None = None) -> int:
+    run_date = run_date or datetime.now(SHANGHAI_TZ).date()
+    cycle = resolve_sync_cycle(run_date)
+    workbook = Path(args.workbook) if args.workbook is not None else None
+    if workbook is None:
+        raise SystemExit("Master workbook is required; set workbook in config.json or pass --workbook")
+    if not workbook.exists():
+        raise SystemExit(f"Master workbook not found: {workbook}")
+    if (args.actual_json is None) != (args.return_json is None):
+        raise SystemExit("Offline mode requires both --actual-json and --return-json")
+
+    actual_start, actual_end = cycle.actual_window.iso()
+    return_start, return_end = cycle.return_window.iso()
+    cookie: str | None = None
+    if args.actual_json is None:
+        cookie = os.environ.get(args.cookie_env)
+        if not cookie:
+            cookie = getpass.getpass(f"{args.cookie_env} is not set; paste ERP Cookie: ")
+        if not cookie.strip():
+            raise SystemExit("ERP Cookie is required")
+
+    actual_document = _load_or_fetch_window(
+        args.actual_json, cookie, args.company_id, actual_start, actual_end
+    )
+    return_document = _load_or_fetch_window(
+        args.return_json, cookie, args.company_id, return_start, return_end
+    )
+
+    snapshot_dir = Path(args.snapshot_dir)
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    actual_snapshot = snapshot_dir / f"actual_{actual_start}_{actual_end}.json"
+    return_snapshot = snapshot_dir / f"return_{return_start}_{return_end}.json"
+    previous_actual = _previous_snapshot(snapshot_dir, "actual", actual_snapshot)
+    previous_return = _previous_snapshot(snapshot_dir, "return", return_snapshot)
+    save_json(actual_snapshot, actual_document)
+    save_json(return_snapshot, return_document)
+
+    actual_rows = api_rows(actual_document)
+    return_rows = api_rows(return_document)
+    aliases = load_aliases(args.aliases)
+    critical_skus = load_target_skus(args.skus_file)
+    prepared = prepare_monthly_update(
+        workbook,
+        cycle,
+        actual_rows,
+        return_rows,
+        aliases,
+        critical_skus,
+    )
+
+    report_dir = Path(args.report_dir) / cycle.node_date.isoformat()
+    actual_fields = ["row", "sheet_sku", "sheet_name", "actual_status", "old_actual", "new_actual"]
+    return_fields = ["row", "sheet_sku", "sheet_name", "return_status", "old_return", "new_return"]
+    write_csv(report_dir / "actual_changes.csv", _monthly_report_rows(prepared.rows, "actual"), actual_fields)
+    write_csv(report_dir / "return_changes.csv", _monthly_report_rows(prepared.rows, "return"), return_fields)
+    write_csv(
+        report_dir / "manual_review.csv",
+        list(prepared.review),
+        ["field", "row", "sheet_sku", "sheet_name", "status", "confidence", "candidate_sku", "candidate_title", "different_columns"],
+    )
+    write_csv(
+        report_dir / "critical_skus.csv",
+        list(prepared.critical_results),
+        ["sku", "sheet_exists", "actual_status", "return_status", "actual_candidate_sku", "actual_candidate_title", "return_candidate_sku", "return_candidate_title", "passed"],
+    )
+    actual_differences = (
+        compare_api_snapshots(api_rows(previous_actual), actual_rows)
+        if previous_actual is not None else []
+    )
+    return_differences = (
+        compare_api_snapshots(api_rows(previous_return), return_rows)
+        if previous_return is not None else []
+    )
+    difference_fields = ["status", "itemOuterId", "title", "field", "old", "new"]
+    write_csv(report_dir / "api_actual_changes.csv", flatten_api_differences(actual_differences), difference_fields)
+    write_csv(report_dir / "api_return_changes.csv", flatten_api_differences(return_differences), difference_fields)
+
+    summary: dict[str, Any] = {
+        "runDate": run_date.isoformat(),
+        "nodeDate": cycle.node_date.isoformat(),
+        "nodeKind": cycle.kind,
+        "actualWindow": [actual_start, actual_end],
+        "returnWindow": [return_start, return_end],
+        "actualApiCount": len(actual_rows),
+        "returnApiCount": len(return_rows),
+        "insertedMonthColumn": prepared.inserted,
+        "formulaCount": prepared.formula_count,
+        "manualReviewRows": len(prepared.review),
+        "criticalFailures": len(prepared.critical_failures),
+        "dryRun": bool(args.dry_run),
+        "workbook": str(workbook),
+        "backup": None,
+        "validation": None,
+    }
+    save_json(report_dir / "summary.json", summary)
+
+    if prepared.critical_failures:
+        print(json.dumps(summary, ensure_ascii=False))
+        return 2
+    if args.dry_run:
+        print(json.dumps(summary, ensure_ascii=False))
+        return 0
+
+    candidate = create_same_directory_temp(workbook)
+    try:
+        fast_patch_zip(workbook, candidate, prepared.replacements)
+        summary["validation"] = validate_workbook(workbook, candidate, cycle)
+        backup = atomic_replace_master(workbook, candidate)
+        summary["backup"] = str(backup)
+    except BaseException:
+        summary["candidate"] = str(candidate)
+        save_json(report_dir / "summary.json", summary)
+        raise
+    save_json(report_dir / "summary.json", summary)
+    print(json.dumps(summary, ensure_ascii=False))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Fetch ERP sales data and quickly patch an existing XLSX workbook.")
+    parser = argparse.ArgumentParser(description="Update the ERP master workbook for the nearest monthly sync node.")
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.json"), help="JSON run configuration")
-    parser.add_argument("--input", type=Path, help="Source XLSX workbook")
-    parser.add_argument("--output", type=Path, help="Output XLSX workbook; omitted in --dry-run mode")
-    parser.add_argument("--start", help="Start date, YYYY-MM-DD")
-    parser.add_argument("--end", help="End date, YYYY-MM-DD")
+    parser.add_argument("--workbook", type=Path, help="Master XLSX workbook updated after validation")
+    parser.add_argument("--snapshot-dir", type=Path)
+    parser.add_argument("--actual-json", type=Path, help="Offline ERP response for the actual-quantity window")
+    parser.add_argument("--return-json", type=Path, help="Offline ERP response for the return-rate window")
     parser.add_argument("--company-id")
     parser.add_argument("--cookie-env")
-    parser.add_argument("--api-json", type=Path, help="Use an existing API JSON instead of making a request")
-    parser.add_argument("--previous-json", type=Path)
-    parser.add_argument("--snapshot", type=Path)
     parser.add_argument("--aliases", type=Path)
-    parser.add_argument("--skus-file", type=Path, help="Optional text file containing one sheet SKU per line")
+    parser.add_argument("--skus-file", type=Path, help="Critical SKU validation list")
     parser.add_argument("--report-dir", type=Path)
     parser.add_argument(
         "--dry-run",
@@ -866,20 +1131,23 @@ def build_parser() -> argparse.ArgumentParser:
 RUN_DEFAULTS: dict[str, Any] = {
     "company_id": "111873",
     "cookie_env": "ERP_COOKIE",
-    "previous_json": Path("erp_dimensions.json"),
-    "snapshot": Path("erp_dimensions_latest.json"),
+    "snapshot_dir": Path("snapshots"),
     "aliases": Path("sku_aliases.json"),
     "report_dir": Path("reports"),
     "dry_run": False,
 }
-CONFIG_KEY_ALIASES = {"start_date": "start", "end_date": "end"}
 CONFIG_PATH_FIELDS = {
-    "input", "output", "api_json", "previous_json", "snapshot", "aliases", "skus_file", "report_dir",
+    "workbook", "snapshot_dir", "actual_json", "return_json", "aliases", "skus_file", "report_dir",
 }
 CONFIG_FIELDS = {
-    "input", "output", "start", "end", "start_date", "end_date", "company_id", "cookie_env",
-    "api_json", "previous_json", "snapshot", "aliases", "skus_file", "report_dir", "dry_run",
+    "workbook", "snapshot_dir", "actual_json", "return_json", "company_id", "cookie_env",
+    "aliases", "skus_file", "report_dir", "dry_run",
 }
+LEGACY_CONFIG_FIELDS = {
+    "input", "output", "start", "end", "start_date", "end_date",
+    "api_json", "previous_json", "snapshot",
+}
+LEGACY_CLI_FLAGS = ("--input", "--output", "--start", "--end", "--api-json")
 
 
 def load_runtime_config(path: Path) -> dict[str, Any]:
@@ -887,6 +1155,11 @@ def load_runtime_config(path: Path) -> dict[str, Any]:
     if not isinstance(document, dict):
         raise SystemExit(f"Config must contain a JSON object: {path}")
     runtime_document = {key: value for key, value in document.items() if not key.startswith("_")}
+    legacy = sorted(set(runtime_document) & LEGACY_CONFIG_FIELDS)
+    if legacy:
+        raise SystemExit(
+            "legacy configuration is no longer supported; set workbook and let the script choose both date windows automatically"
+        )
     unknown = sorted(set(runtime_document) - CONFIG_FIELDS)
     if unknown:
         raise SystemExit(f"Unknown config fields: {', '.join(unknown)}")
@@ -894,7 +1167,7 @@ def load_runtime_config(path: Path) -> dict[str, Any]:
     values: dict[str, Any] = {}
     config_dir = path.resolve().parent
     for source_key, value in runtime_document.items():
-        key = CONFIG_KEY_ALIASES.get(source_key, source_key)
+        key = source_key
         if key in CONFIG_PATH_FIELDS and value not in (None, ""):
             configured_path = Path(value)
             value = configured_path if configured_path.is_absolute() else config_dir / configured_path
@@ -904,6 +1177,11 @@ def load_runtime_config(path: Path) -> dict[str, Any]:
 
 def parse_runtime_args(argv: list[str] | None = None) -> argparse.Namespace:
     argv_list = list(argv) if argv is not None else sys.argv[1:]
+    for item in argv_list:
+        if any(item == flag or item.startswith(flag + "=") for flag in LEGACY_CLI_FLAGS):
+            raise SystemExit(
+                "legacy command-line dates/input/output are no longer supported; use --workbook"
+            )
     config_parser = argparse.ArgumentParser(add_help=False)
     config_parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.json"))
     config_args, _ = config_parser.parse_known_args(argv_list)
@@ -923,65 +1201,7 @@ def parse_runtime_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_runtime_args(argv)
-    if args.input is None:
-        raise SystemExit("Input workbook is required; set input in config.json or pass --input")
-    if not args.start or not args.end:
-        raise SystemExit("Start and end dates are required; set start_date/end_date in config.json or pass --start/--end")
-    if not args.input.exists():
-        raise SystemExit(f"Input workbook not found: {args.input}")
-    if not args.dry_run and args.output is None:
-        raise SystemExit("--output is required unless --dry-run is used")
-
-    previous_document = load_json(args.previous_json) if args.previous_json.exists() else None
-    if args.api_json:
-        latest_document = load_json(args.api_json)
-    else:
-        cookie = os.environ.get(args.cookie_env)
-        if not cookie:
-            cookie = getpass.getpass(f"{args.cookie_env} is not set; paste ERP Cookie: ")
-        if not cookie.strip():
-            raise SystemExit("ERP Cookie is required")
-        latest_document = fetch_api(cookie, args.company_id, args.start, args.end)
-        save_json(args.snapshot, latest_document)
-
-    latest_rows = api_rows(latest_document)
-    aliases = load_aliases(args.aliases)
-    targets = load_target_skus(args.skus_file)
-    report = sync_workbook(args.input, None if args.dry_run else args.output, latest_rows, aliases, targets)
-
-    api_differences = (
-        compare_api_snapshots(api_rows(previous_document), latest_rows)
-        if previous_document is not None
-        else []
-    )
-    write_csv(
-        args.report_dir / "manual_review.csv",
-        report["review"],
-        ["row", "sheet_sku", "sheet_name", "status", "confidence", "candidate_sku", "candidate_title", "different_columns"],
-    )
-    write_csv(
-        args.report_dir / "sync_changes.csv",
-        report["rows"],
-        ["row", "sheet_sku", "sheet_name", "match_status", "candidate_sku", "old_actual", "new_actual", "old_return_rate", "new_return_rate", "changed_columns"],
-    )
-    write_csv(
-        args.report_dir / "api_changes.csv",
-        flatten_api_differences(api_differences),
-        ["status", "itemOuterId", "title", "field", "old", "new"],
-    )
-    summary = {
-        "apiCount": len(latest_rows),
-        "writtenRows": report["written"],
-        "unchangedRows": report["unchanged"],
-        "manualReviewRows": len(report["review"]),
-        "apiChangedItems": len(api_differences),
-        "output": str(args.output) if args.output else None,
-        "snapshot": str(args.snapshot) if not args.api_json else str(args.api_json),
-        "reportDir": str(args.report_dir),
-    }
-    save_json(args.report_dir / "summary.json", summary)
-    print(json.dumps(summary, ensure_ascii=False))
-    return 0
+    return run_monthly_sync(args)
 
 
 if __name__ == "__main__":

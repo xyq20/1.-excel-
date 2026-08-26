@@ -6,7 +6,7 @@ set "PYTHONUTF8=1"
 set "PYTHONIOENCODING=utf-8"
 
 echo ========================================
-echo KuaiMai ERP data sync
+echo ERP monthly actual and return-rate sync
 echo Config: %~dp0config.json
 echo ========================================
 
@@ -22,7 +22,7 @@ set "SYNC_EXIT_CODE=%ERRORLEVEL%"
 
 if "%SYNC_EXIT_CODE%"=="0" (
     echo.
-    echo [OK] Sync completed.
+    echo [OK] Monthly sync completed. The previous workbook is kept as .bak.
 ) else (
     echo.
     echo [ERROR] Sync failed. Exit code: %SYNC_EXIT_CODE%
