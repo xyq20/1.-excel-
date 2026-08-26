@@ -1,5 +1,12 @@
 import re
+import os
+import json
+from pathlib import Path
+import shutil
+import struct
+import tempfile
 import unittest
+import zipfile
 from datetime import date
 from xml.etree import ElementTree as ET
 
@@ -17,7 +24,15 @@ from xlsx_monthly import (
     shift_qualified_worksheet_formulas,
     update_workbook_xml,
 )
-from erp_excel_sync import MatchResult, RETURN_RATE_FIELD, choose_candidate
+from erp_excel_sync import (
+    MatchResult,
+    RETURN_RATE_FIELD,
+    atomic_replace_master,
+    choose_candidate,
+    create_same_directory_temp,
+    fast_patch_zip,
+    validate_workbook,
+)
 
 
 def workbook_sheet(
@@ -68,6 +83,385 @@ def august_sheet(*, extras: bytes = b'<autoFilter ref="B1:AY10"/>') -> bytes:
     )
 
 
+def write_test_xlsx(
+    path: Path,
+    *,
+    sheet: bytes | None = None,
+    sheet_names: tuple[str, ...] = ("分级总表",),
+    media: bytes = b"original-media-bytes",
+    comment: bytes = b"workbook-comment",
+    compression: int = zipfile.ZIP_DEFLATED,
+) -> None:
+    sheet = sheet or workbook_sheet(
+        [
+            ("W", "7月实发"),
+            ("X", "同期销量"),
+            ("Y", "8月实发（8.15）"),
+            ("Z", "变化情况"),
+            ("AA", "退货率（7.1-7.31）"),
+        ],
+        rows=(
+            b'<row r="2"><c r="E2" t="inlineStr"><is><t>SKU-1</t></is></c>'
+            b'<c r="F2" t="inlineStr"><is><t>Product</t></is></c>'
+            b'<c r="W2"><v>31</v></c><c r="X2"><f>W2/31*14</f></c>'
+            b'<c r="Y2"><v>10</v></c><c r="Z2"><f>'
+            + 'TEXT(Y2-X2,&quot;8月增加0件；8月减少0件；持平&quot;)'.encode()
+            + b'</f></c>'
+            b'<c r="AA2"><v>0.1</v></c></row>'
+        ),
+    )
+    workbook = (
+        b'<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        b'<sheets>'
+        + b"".join(
+            (
+                f'<sheet name="{name}" sheetId="{index}" '
+                f'r:id="rId{index}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"/>'
+            ).encode("utf-8")
+            for index, name in enumerate(sheet_names, 1)
+        )
+        + b'</sheets></workbook>'
+    )
+    parts = {
+        "[Content_Types].xml": b'<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>',
+        "_rels/.rels": b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>',
+        "xl/workbook.xml": workbook,
+        "xl/_rels/workbook.xml.rels": b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>',
+        "xl/worksheets/sheet1.xml": sheet,
+        "xl/worksheets/sheet2.xml": b'<worksheet><sheetData/></worksheet>',
+        "xl/drawings/drawing1.xml": b'<xdr:wsDr xmlns:xdr="urn:xdr"><xdr:twoCellAnchor/></xdr:wsDr>',
+        "xl/media/image1.png": media,
+    }
+    with zipfile.ZipFile(path, "w", compression=compression) as archive:
+        archive.comment = comment
+        for index, (name, data) in enumerate(parts.items()):
+            info = zipfile.ZipInfo(name, date_time=(2024, 1, 2, 3, 4, index * 2))
+            info.compress_type = compression
+            info.comment = f"part-{index}".encode("ascii")
+            info.extra = b"\xfe\xca\x02\x00ok"
+            archive.writestr(info, data)
+
+
+def raw_local_records(path: Path) -> dict[str, bytes]:
+    data = path.read_bytes()
+    with zipfile.ZipFile(path) as archive:
+        infos = sorted(archive.infolist(), key=lambda info: info.header_offset)
+        boundaries = [info.header_offset for info in infos[1:]] + [archive.start_dir]
+        return {
+            info.filename: data[info.header_offset:end]
+            for info, end in zip(infos, boundaries)
+        }
+
+
+class FastPatchZipTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        self.source = self.root / "source.xlsx"
+        self.output = self.root / "output.xlsx"
+        write_test_xlsx(self.source)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_patches_multiple_parts_and_preserves_untouched_local_records_and_metadata(self):
+        replacements = {
+            "xl/worksheets/sheet1.xml": b"<worksheet><sheetData/></worksheet>",
+            "xl/workbook.xml": b"<workbook><sheets/></workbook>",
+            "xl/worksheets/sheet2.xml": b"<worksheet><sheetData><row r=\"1\"/></sheetData></worksheet>",
+            "xl/drawings/drawing1.xml": b"<xdr:wsDr xmlns:xdr=\"urn:xdr\"/>",
+        }
+
+        fast_patch_zip(self.source, self.output, replacements)
+
+        with zipfile.ZipFile(self.source) as before, zipfile.ZipFile(self.output) as after:
+            self.assertEqual(after.testzip(), None)
+            self.assertEqual(after.comment, before.comment)
+            self.assertEqual(after.namelist(), before.namelist())
+            for name, replacement in replacements.items():
+                self.assertEqual(after.read(name), replacement)
+            media_before = before.getinfo("xl/media/image1.png")
+            media_after = after.getinfo("xl/media/image1.png")
+            self.assertEqual(
+                (media_after.CRC, media_after.file_size, media_after.compress_size,
+                 media_after.date_time, media_after.flag_bits, media_after.extra, media_after.comment),
+                (media_before.CRC, media_before.file_size, media_before.compress_size,
+                 media_before.date_time, media_before.flag_bits, media_before.extra, media_before.comment),
+            )
+        self.assertEqual(
+            raw_local_records(self.output)["xl/media/image1.png"],
+            raw_local_records(self.source)["xl/media/image1.png"],
+        )
+
+    def test_rejects_missing_target_without_creating_output(self):
+        with self.assertRaisesRegex(RuntimeError, "missing replacement target"):
+            fast_patch_zip(self.source, self.output, {"xl/missing.xml": b"nope"})
+        self.assertFalse(self.output.exists())
+
+    def test_rejects_encrypted_member(self):
+        data = bytearray(self.source.read_bytes())
+        with zipfile.ZipFile(self.source) as archive:
+            info = archive.infolist()[0]
+            struct.pack_into("<H", data, info.header_offset + 6, info.flag_bits | 1)
+            central = archive.start_dir
+        struct.pack_into("<H", data, central + 8, 1)
+        encrypted = self.root / "encrypted.xlsx"
+        encrypted.write_bytes(data)
+
+        with self.assertRaisesRegex(RuntimeError, "encrypted"):
+            fast_patch_zip(encrypted, self.output, {"xl/workbook.xml": b"<workbook/>"})
+
+    def test_rejects_zip64_archive_marker(self):
+        data = bytearray(self.source.read_bytes())
+        eocd = data.rfind(b"PK\x05\x06")
+        struct.pack_into("<H", data, eocd + 10, 0xFFFF)
+        zip64 = self.root / "zip64.xlsx"
+        zip64.write_bytes(data)
+
+        with self.assertRaisesRegex(RuntimeError, "ZIP64"):
+            fast_patch_zip(zip64, self.output, {"xl/workbook.xml": b"<workbook/>"})
+
+    def test_rejects_unsupported_compression(self):
+        unsupported = self.root / "unsupported.xlsx"
+        write_test_xlsx(unsupported, compression=zipfile.ZIP_BZIP2)
+
+        with self.assertRaisesRegex(RuntimeError, "unsupported compression"):
+            fast_patch_zip(unsupported, self.output, {"xl/workbook.xml": b"<workbook/>"})
+
+    def test_rebuilds_crc_for_every_replacement(self):
+        replacements = {
+            "xl/workbook.xml": b"<workbook><new/></workbook>",
+            "xl/worksheets/sheet1.xml": b"<worksheet><sheetData><row r=\"99\"/></sheetData></worksheet>",
+        }
+
+        fast_patch_zip(self.source, self.output, replacements)
+
+        with zipfile.ZipFile(self.output) as archive:
+            for name, value in replacements.items():
+                self.assertEqual(archive.getinfo(name).CRC, zipfile.crc32(value))
+                self.assertEqual(archive.read(name), value)
+
+
+@unittest.skipUnless(
+    os.environ.get("ERP_REAL_WORKBOOK"),
+    "set ERP_REAL_WORKBOOK to run the large read-only workbook smoke test",
+)
+class RealWorkbookSmokeTests(unittest.TestCase):
+    def test_patches_a_copy_and_preserves_real_media_crc_manifest(self):
+        original = Path(os.environ["ERP_REAL_WORKBOOK"])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "source-copy.xlsx"
+            candidate = Path(temp_dir) / "candidate.xlsx"
+            shutil.copy2(original, source)
+            with zipfile.ZipFile(source) as archive:
+                sheet = archive.read("xl/worksheets/sheet1.xml")
+                source_media = {
+                    info.filename: (info.CRC, info.file_size, info.compress_size)
+                    for info in archive.infolist()
+                    if info.filename.startswith("xl/media/") and not info.is_dir()
+                }
+
+            fast_patch_zip(
+                source,
+                candidate,
+                {"xl/worksheets/sheet1.xml": sheet},
+            )
+
+            with zipfile.ZipFile(candidate) as archive:
+                candidate_media = {
+                    info.filename: (info.CRC, info.file_size, info.compress_size)
+                    for info in archive.infolist()
+                    if info.filename.startswith("xl/media/") and not info.is_dir()
+                }
+                self.assertIsNone(archive.testzip())
+            self.assertEqual(candidate_media, source_media)
+
+
+class AtomicWorkbookReplaceTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        self.master = self.root / "master.xlsx"
+        self.candidate = self.root / "candidate.xlsx"
+        self.master.write_bytes(b"old-master")
+        self.candidate.write_bytes(b"validated-candidate")
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_creates_unique_temp_files_in_master_directory(self):
+        first = create_same_directory_temp(self.master)
+        second = create_same_directory_temp(self.master)
+
+        self.assertEqual(first.parent, self.master.parent)
+        self.assertEqual(second.parent, self.master.parent)
+        self.assertNotEqual(first, second)
+        self.assertTrue(first.exists())
+        self.assertTrue(second.exists())
+
+    def test_success_keeps_one_recent_backup_and_consumes_candidate(self):
+        backup = self.master.with_suffix(self.master.suffix + ".bak")
+
+        result = atomic_replace_master(self.master, self.candidate)
+
+        self.assertEqual(result, backup)
+        self.assertEqual(self.master.read_bytes(), b"validated-candidate")
+        self.assertEqual(backup.read_bytes(), b"old-master")
+        self.assertFalse(self.candidate.exists())
+        self.assertEqual(sorted(path.name for path in self.root.iterdir()), ["master.xlsx", "master.xlsx.bak"])
+
+    def test_second_rename_failure_rolls_backup_back_to_master(self):
+        calls: list[tuple[Path, Path]] = []
+
+        def fail_second(source, destination):
+            calls.append((Path(source), Path(destination)))
+            if len(calls) == 2:
+                raise PermissionError("candidate is locked")
+            os.replace(source, destination)
+
+        with self.assertRaisesRegex(PermissionError, "locked"):
+            atomic_replace_master(self.master, self.candidate, replace=fail_second)
+
+        self.assertEqual(self.master.read_bytes(), b"old-master")
+        self.assertTrue(self.candidate.exists())
+        self.assertFalse(self.master.with_suffix(".xlsx.bak").exists())
+        self.assertEqual(len(calls), 3)
+
+    def test_first_rename_failure_leaves_master_and_existing_backup_unchanged(self):
+        backup = self.master.with_suffix(".xlsx.bak")
+        backup.write_bytes(b"older-backup")
+
+        def fail_first(source, destination):
+            raise PermissionError("master is locked")
+
+        with self.assertRaisesRegex(PermissionError, "master is locked"):
+            atomic_replace_master(self.master, self.candidate, replace=fail_first)
+
+        self.assertEqual(self.master.read_bytes(), b"old-master")
+        self.assertEqual(backup.read_bytes(), b"older-backup")
+        self.assertTrue(self.candidate.exists())
+
+    def test_existing_backup_is_atomically_overwritten_on_success(self):
+        backup = self.master.with_suffix(".xlsx.bak")
+        backup.write_bytes(b"older-backup")
+
+        atomic_replace_master(self.master, self.candidate)
+
+        self.assertEqual(backup.read_bytes(), b"old-master")
+        self.assertEqual(self.master.read_bytes(), b"validated-candidate")
+        self.assertEqual([path for path in self.root.iterdir() if path.suffix == ".bak"], [backup])
+
+
+class WorkbookValidationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        self.source = self.root / "source.xlsx"
+        self.candidate = self.root / "candidate.xlsx"
+        write_test_xlsx(self.source)
+        write_test_xlsx(self.candidate)
+        self.cycle = resolve_sync_cycle(date(2026, 8, 15))
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def _sheet(self) -> bytes:
+        with zipfile.ZipFile(self.source) as archive:
+            return archive.read("xl/worksheets/sheet1.xml")
+
+    def _patch_sheet(self, sheet: bytes) -> None:
+        fast_patch_zip(
+            self.source,
+            self.candidate,
+            {"xl/worksheets/sheet1.xml": sheet},
+        )
+
+    def test_validation_success_returns_json_serializable_counts_and_layout(self):
+        summary = validate_workbook(self.source, self.candidate, self.cycle)
+
+        json.dumps(summary)
+        self.assertEqual(summary["row_count"], 2)
+        self.assertEqual(summary["sheet_names"], ["分级总表"])
+        self.assertEqual(summary["sku_rows"], 1)
+        self.assertEqual(summary["peer_formula_count"], 1)
+        self.assertEqual(summary["change_formula_count"], 1)
+        self.assertEqual(summary["media_count"], 1)
+        self.assertEqual(summary["layout"]["actual_col"], "Y")
+
+    def test_rejects_wrong_normalized_actual_header(self):
+        self._patch_sheet(
+            self._sheet().replace(
+                "8月实发（8.15）".encode(),
+                "8月实发（8.14）".encode(),
+            )
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "actual header"):
+            validate_workbook(self.source, self.candidate, self.cycle)
+
+    def test_rejects_wrong_normalized_return_header(self):
+        self._patch_sheet(
+            self._sheet().replace(
+                "退货率（7.1-7.31）".encode(),
+                "退货率（7.2-7.31）".encode(),
+            )
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "return header"):
+            validate_workbook(self.source, self.candidate, self.cycle)
+
+    def test_rejects_peer_formula_that_does_not_match_discovered_columns(self):
+        self._patch_sheet(self._sheet().replace(b"W2/31*14", b"V2/31*14"))
+
+        with self.assertRaisesRegex(RuntimeError, "peer formula.*row 2"):
+            validate_workbook(self.source, self.candidate, self.cycle)
+
+    def test_rejects_change_formula_that_does_not_match_discovered_columns(self):
+        self._patch_sheet(self._sheet().replace(b"TEXT(Y2-X2", b"TEXT(Y2-W2"))
+
+        with self.assertRaisesRegex(RuntimeError, "change formula.*row 2"):
+            validate_workbook(self.source, self.candidate, self.cycle)
+
+    def test_rejects_changed_or_added_media_manifest(self):
+        write_test_xlsx(self.candidate, media=b"different-media-byte")
+
+        with self.assertRaisesRegex(RuntimeError, "media manifest"):
+            validate_workbook(self.source, self.candidate, self.cycle)
+
+    def test_rejects_changed_row_count(self):
+        self._patch_sheet(
+            self._sheet().replace(
+                b"</sheetData>",
+                b'<row r="3"><c r="A3"><v>1</v></c></row></sheetData>',
+            )
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "row count"):
+            validate_workbook(self.source, self.candidate, self.cycle)
+
+    def test_rejects_changed_sheet_names(self):
+        write_test_xlsx(self.candidate, sheet_names=("Other",))
+
+        with self.assertRaisesRegex(RuntimeError, "sheet names"):
+            validate_workbook(self.source, self.candidate, self.cycle)
+
+    def test_rejects_missing_required_part(self):
+        incomplete = self.root / "incomplete.xlsx"
+        with zipfile.ZipFile(incomplete, "w") as archive:
+            archive.writestr("xl/workbook.xml", b"<workbook/>")
+
+        with self.assertRaisesRegex(RuntimeError, "required workbook part"):
+            validate_workbook(self.source, incomplete, self.cycle)
+
+    def test_rejects_unreadable_auxiliary_xml(self):
+        fast_patch_zip(
+            self.source,
+            self.candidate,
+            {"xl/worksheets/sheet2.xml": b"<worksheet>"},
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "readable XML.*sheet2"):
+            validate_workbook(self.source, self.candidate, self.cycle)
 class ColumnAndHeaderTests(unittest.TestCase):
     def test_column_conversions_are_total_for_valid_excel_columns(self):
         self.assertEqual(column_number("A"), 1)

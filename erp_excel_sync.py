@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import struct
 import sys
+import tempfile
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlencode
@@ -18,7 +19,8 @@ import zlib
 import zipfile
 from xml.etree import ElementTree as ET
 
-from xlsx_monthly import column_number
+from monthly_schedule import SyncCycle
+from xlsx_monthly import column_number, validate_monthly_sheet
 
 
 SHANGHAI_TZ = timezone(timedelta(hours=8))
@@ -455,72 +457,347 @@ def read_shared_strings(archive: zipfile.ZipFile) -> list[str]:
     ]
 
 
-def _raw_local_record(data: bytes, info: zipfile.ZipInfo) -> bytes:
-    start = info.header_offset
-    if data[start : start + 4] != b"PK\x03\x04":
-        raise RuntimeError(f"Unexpected ZIP local header for {info.filename}")
-    name_length, extra_length = struct.unpack_from("<HH", data, start + 26)
-    end = start + 30 + name_length + extra_length + info.compress_size
-    return data[start:end]
+def _zip_extra_has_zip64(extra: bytes) -> bool:
+    position = 0
+    while position + 4 <= len(extra):
+        field_id, size = struct.unpack_from("<HH", extra, position)
+        position += 4
+        if position + size > len(extra):
+            raise RuntimeError("malformed ZIP extra field")
+        if field_id == 0x0001:
+            return True
+        position += size
+    return False
 
 
-def fast_patch_zip(source: Path, output: Path, modified_sheet: bytes) -> None:
+def _zip_end_record(
+    data: bytes,
+) -> tuple[int, tuple[int, int, int, int, int, int], bytes]:
+    search_start = max(0, len(data) - (22 + 0xFFFF))
+    position = data.rfind(b"PK\x05\x06", search_start)
+    while position >= 0:
+        if position + 22 <= len(data):
+            candidate_comment_size = struct.unpack_from("<H", data, position + 20)[0]
+            if position + 22 + candidate_comment_size == len(data):
+                break
+        position = data.rfind(b"PK\x05\x06", search_start, position)
+    if position < 0:
+        raise RuntimeError("ZIP end record not found")
+    disk, central_disk, disk_count, total_count, central_size, central_start, comment_size = (
+        struct.unpack_from("<HHHHIIH", data, position + 4)
+    )
+    if (
+        disk_count == 0xFFFF
+        or total_count == 0xFFFF
+        or central_size == 0xFFFFFFFF
+        or central_start == 0xFFFFFFFF
+        or data[max(0, position - 20) : position].startswith(b"PK\x06\x07")
+    ):
+        raise RuntimeError("ZIP64 archives are unsupported")
+    if disk != 0 or central_disk != 0 or disk_count != total_count:
+        raise RuntimeError("multi-disk ZIP archives are unsupported")
+    return (
+        position,
+        (disk_count, total_count, central_size, central_start, comment_size, disk),
+        data[position : position + 22 + comment_size],
+    )
+
+
+def _central_records(
+    data: bytes,
+    central_start: int,
+    central_size: int,
+    count: int,
+) -> tuple[list[bytes], bytes]:
+    records: list[bytes] = []
+    position = central_start
+    for _index in range(count):
+        if data[position : position + 4] != b"PK\x01\x02":
+            raise RuntimeError("ZIP central directory signature not found")
+        name_size, extra_size, comment_size = struct.unpack_from(
+            "<HHH", data, position + 28
+        )
+        disk_start = struct.unpack_from("<H", data, position + 34)[0]
+        compressed_size, file_size, local_offset = struct.unpack_from(
+            "<III", data, position + 20
+        )
+        length = 46 + name_size + extra_size + comment_size
+        if position + length > len(data):
+            raise RuntimeError("truncated ZIP central directory")
+        extra = data[
+            position + 46 + name_size : position + 46 + name_size + extra_size
+        ]
+        if (
+            disk_start != 0
+            or compressed_size == 0xFFFFFFFF
+            or file_size == 0xFFFFFFFF
+            or local_offset == 0xFFFFFFFF
+            or _zip_extra_has_zip64(extra)
+        ):
+            if disk_start != 0:
+                raise RuntimeError("multi-disk ZIP archives are unsupported")
+            raise RuntimeError("ZIP64 archives are unsupported")
+        records.append(data[position : position + length])
+        position += length
+    central_end = central_start + central_size
+    if position > central_end or central_end > len(data):
+        raise RuntimeError("invalid ZIP central directory size")
+    return records, data[position:central_end]
+
+
+def _raw_local_records(
+    data: bytes,
+    infos: list[zipfile.ZipInfo],
+    central_start: int,
+) -> dict[int, bytes]:
+    ordered = sorted(infos, key=lambda item: item.header_offset)
+    boundaries = [item.header_offset for item in ordered[1:]] + [central_start]
+    records: dict[int, bytes] = {}
+    for info, end in zip(ordered, boundaries):
+        start = info.header_offset
+        if data[start : start + 4] != b"PK\x03\x04" or end < start:
+            raise RuntimeError(f"unexpected ZIP local header for {info.filename}")
+        name_size, extra_size = struct.unpack_from("<HH", data, start + 26)
+        extra = data[start + 30 + name_size : start + 30 + name_size + extra_size]
+        local_sizes = struct.unpack_from("<II", data, start + 18)
+        if 0xFFFFFFFF in local_sizes or _zip_extra_has_zip64(extra):
+            raise RuntimeError("ZIP64 archives are unsupported")
+        records[start] = data[start:end]
+    return records
+
+
+def _compress_replacement(value: bytes, method: int) -> bytes:
+    if method == zipfile.ZIP_STORED:
+        return value
+    if method == zipfile.ZIP_DEFLATED:
+        compressor = zlib.compressobj(level=6, wbits=-15)
+        return compressor.compress(value) + compressor.flush()
+    raise RuntimeError(f"unsupported compression method {method}")
+
+
+def _replacement_local_record(
+    original: bytes,
+    info: zipfile.ZipInfo,
+    value: bytes,
+) -> tuple[bytes, int, int]:
+    name_size, extra_size = struct.unpack_from("<HH", original, 26)
+    header_size = 30 + name_size + extra_size
+    header = bytearray(original[:header_size])
+    compressed = _compress_replacement(value, info.compress_type)
+    crc = zlib.crc32(value) & 0xFFFFFFFF
+    if len(value) > 0xFFFFFFFF or len(compressed) > 0xFFFFFFFF:
+        raise RuntimeError("ZIP64 archives are unsupported")
+    tail_start = header_size + info.compress_size
+    old_tail = original[tail_start:]
+    if info.flag_bits & 0x08:
+        struct.pack_into("<III", header, 14, 0, 0, 0)
+        signature = b"PK\x07\x08" if old_tail.startswith(b"PK\x07\x08") else b""
+        descriptor_size = 16 if signature else 12
+        remainder = old_tail[descriptor_size:]
+        descriptor = signature + struct.pack("<III", crc, len(compressed), len(value))
+        tail = descriptor + remainder
+    else:
+        struct.pack_into("<III", header, 14, crc, len(compressed), len(value))
+        tail = old_tail
+    return bytes(header) + compressed + tail, crc, len(compressed)
+
+
+def fast_patch_zip(
+    source: Path,
+    output: Path,
+    replacements: dict[str, bytes],
+) -> None:
+    source = Path(source)
+    output = Path(output)
+    if source.resolve() == output.resolve():
+        raise RuntimeError("source and output must be different paths")
+    if not isinstance(replacements, dict) or not replacements:
+        raise RuntimeError("at least one ZIP replacement is required")
     original_data = source.read_bytes()
+    _end_position, end_values, end_record = _zip_end_record(original_data)
+    _disk_count, total_count, central_size, central_start, _comment_size, _disk = end_values
+    central_records, central_trailer = _central_records(
+        original_data, central_start, central_size, total_count
+    )
     with zipfile.ZipFile(source, "r") as archive:
         infos = archive.infolist()
-        target = next(info for info in infos if info.filename == WORKSHEET_PATH)
-        central_directory_start = archive.start_dir
-        old_record = _raw_local_record(original_data, target)
-        compressor = zlib.compressobj(level=6, wbits=-15)
-        compressed_sheet = compressor.compress(modified_sheet) + compressor.flush()
-        crc = zlib.crc32(modified_sheet) & 0xFFFFFFFF
-        name_length, extra_length = struct.unpack_from("<HH", original_data, target.header_offset + 26)
-        header_length = 30 + name_length + extra_length
-        local_header = bytearray(original_data[target.header_offset : target.header_offset + header_length])
-        struct.pack_into("<III", local_header, 14, crc, len(compressed_sheet), len(modified_sheet))
+        names = {info.filename for info in infos}
+        missing = sorted(set(replacements) - names)
+        if missing:
+            raise RuntimeError(f"missing replacement target(s): {', '.join(missing)}")
+        if len(infos) != total_count or len(central_records) != len(infos):
+            raise RuntimeError("ZIP member count does not match central directory")
+        encrypted = [info.filename for info in infos if info.flag_bits & 0x01]
+        if encrypted:
+            raise RuntimeError(f"encrypted ZIP member is unsupported: {encrypted[0]}")
+        local_records = _raw_local_records(original_data, infos, central_start)
 
         output.parent.mkdir(parents=True, exist_ok=True)
-        new_offsets: dict[str, int] = {}
-        offset = 0
+        new_offsets: list[int] = []
+        replacement_metadata: dict[int, tuple[int, int, int]] = {}
         with output.open("wb") as destination:
-            for info in infos:
-                new_offsets[info.filename] = offset
-                if info.filename == WORKSHEET_PATH:
-                    destination.write(local_header)
-                    destination.write(compressed_sheet)
-                    offset += len(local_header) + len(compressed_sheet)
-                else:
-                    record = _raw_local_record(original_data, info)
+            for index, info in enumerate(infos):
+                new_offsets.append(destination.tell())
+                original_record = local_records[info.header_offset]
+                if info.filename in replacements:
+                    value = replacements[info.filename]
+                    if not isinstance(value, bytes):
+                        raise TypeError(f"replacement for {info.filename} must be bytes")
+                    record, crc, compressed_size = _replacement_local_record(
+                        original_record, info, value
+                    )
+                    replacement_metadata[index] = (crc, compressed_size, len(value))
                     destination.write(record)
-                    offset += len(record)
+                else:
+                    destination.write(original_record)
 
-            new_central_start = offset
-            position = central_directory_start
-            for info in infos:
-                if original_data[position : position + 4] != b"PK\x01\x02":
-                    raise RuntimeError("ZIP central directory signature not found")
-                name_length, extra_length, comment_length = struct.unpack_from("<HHH", original_data, position + 28)
-                record_length = 46 + name_length + extra_length + comment_length
-                record = bytearray(original_data[position : position + record_length])
-                struct.pack_into(
-                    "<III",
-                    record,
-                    16,
-                    crc if info.filename == WORKSHEET_PATH else info.CRC,
-                    len(compressed_sheet) if info.filename == WORKSHEET_PATH else info.compress_size,
-                    len(modified_sheet) if info.filename == WORKSHEET_PATH else info.file_size,
-                )
-                struct.pack_into("<I", record, 42, new_offsets[info.filename])
+            new_central_start = destination.tell()
+            for index, original_record in enumerate(central_records):
+                record = bytearray(original_record)
+                if index in replacement_metadata:
+                    struct.pack_into("<III", record, 16, *replacement_metadata[index])
+                if new_offsets[index] > 0xFFFFFFFF:
+                    raise RuntimeError("ZIP64 archives are unsupported")
+                struct.pack_into("<I", record, 42, new_offsets[index])
                 destination.write(record)
-                position += record_length
+            destination.write(central_trailer)
+            new_central_size = destination.tell() - new_central_start
+            if new_central_size > 0xFFFFFFFF or new_central_start > 0xFFFFFFFF:
+                raise RuntimeError("ZIP64 archives are unsupported")
+            updated_end = bytearray(end_record)
+            struct.pack_into("<II", updated_end, 12, new_central_size, new_central_start)
+            destination.write(updated_end)
 
-            central_size = destination.tell() - new_central_start
-            end_record_position = original_data.rfind(b"PK\x05\x06", central_directory_start)
-            if end_record_position < 0:
-                raise RuntimeError("ZIP end record not found")
-            end_record = bytearray(original_data[end_record_position : end_record_position + 22])
-            struct.pack_into("<II", end_record, 12, central_size, new_central_start)
-            destination.write(end_record)
+
+def create_same_directory_temp(master: Path) -> Path:
+    master = Path(master)
+    descriptor, name = tempfile.mkstemp(
+        dir=master.parent,
+        prefix=f".{master.name}.",
+        suffix=".tmp",
+    )
+    os.close(descriptor)
+    return Path(name)
+
+
+def atomic_replace_master(
+    master: Path,
+    validated_temp: Path,
+    replace=os.replace,
+) -> Path:
+    master = Path(master)
+    validated_temp = Path(validated_temp)
+    backup = master.with_suffix(master.suffix + ".bak")
+    replace(master, backup)
+    try:
+        replace(validated_temp, master)
+    except BaseException:
+        replace(backup, master)
+        raise
+    return backup
+
+
+REQUIRED_WORKBOOK_PARTS = (
+    "[Content_Types].xml",
+    "_rels/.rels",
+    "xl/workbook.xml",
+    "xl/_rels/workbook.xml.rels",
+    WORKSHEET_PATH,
+)
+
+
+def _validated_archive_parts(
+    path: Path,
+) -> tuple[dict[str, bytes], dict[str, tuple[int, int]], list[str]]:
+    try:
+        with zipfile.ZipFile(path, "r") as archive:
+            bad_member = archive.testzip()
+            if bad_member is not None:
+                raise RuntimeError(f"workbook CRC failure in {bad_member}")
+            names = set(archive.namelist())
+            missing = [name for name in REQUIRED_WORKBOOK_PARTS if name not in names]
+            if missing:
+                raise RuntimeError(
+                    f"missing required workbook part(s): {', '.join(missing)}"
+                )
+            xml_parts: dict[str, bytes] = {}
+            for name in archive.namelist():
+                if not (name.endswith(".xml") or name.endswith(".rels")):
+                    continue
+                value = archive.read(name)
+                try:
+                    ET.fromstring(value)
+                except ET.ParseError as exc:
+                    raise RuntimeError(f"readable XML check failed for {name}: {exc}") from exc
+                if name in REQUIRED_WORKBOOK_PARTS:
+                    xml_parts[name] = value
+            media = {
+                info.filename: (info.CRC, info.file_size)
+                for info in archive.infolist()
+                if info.filename.startswith("xl/media/") and not info.is_dir()
+            }
+    except zipfile.BadZipFile as exc:
+        raise RuntimeError(f"invalid ZIP workbook {path}: {exc}") from exc
+
+    workbook_root = ET.fromstring(xml_parts["xl/workbook.xml"])
+    sheet_names = [
+        str(node.attrib.get("name", ""))
+        for node in workbook_root.iter()
+        if node.tag.rsplit("}", 1)[-1] == "sheet"
+    ]
+    return xml_parts, media, sheet_names
+
+
+def _xml_row_count(sheet_xml: bytes) -> int:
+    root = ET.fromstring(sheet_xml)
+    return sum(1 for node in root.iter() if node.tag.rsplit("}", 1)[-1] == "row")
+
+
+def validate_workbook(
+    source: Path,
+    candidate: Path,
+    cycle: SyncCycle,
+) -> dict[str, Any]:
+    source = Path(source)
+    candidate = Path(candidate)
+    source_parts, source_media, source_sheet_names = _validated_archive_parts(source)
+    candidate_parts, candidate_media, candidate_sheet_names = _validated_archive_parts(
+        candidate
+    )
+    if candidate_sheet_names != source_sheet_names:
+        raise RuntimeError(
+            f"sheet names changed: source={source_sheet_names!r}, "
+            f"candidate={candidate_sheet_names!r}"
+        )
+    if candidate_media != source_media:
+        raise RuntimeError("media manifest differs between source and candidate")
+
+    source_sheet = source_parts[WORKSHEET_PATH]
+    candidate_sheet = candidate_parts[WORKSHEET_PATH]
+    source_row_count = _xml_row_count(source_sheet)
+    candidate_row_count = _xml_row_count(candidate_sheet)
+    if candidate_row_count != source_row_count:
+        raise RuntimeError(
+            f"row count changed: source={source_row_count}, candidate={candidate_row_count}"
+        )
+
+    with zipfile.ZipFile(candidate, "r") as archive:
+        shared_strings = (
+            read_shared_strings(archive)
+            if "xl/sharedStrings.xml" in archive.namelist()
+            else []
+        )
+    try:
+        sheet_summary = validate_monthly_sheet(candidate_sheet, shared_strings, cycle)
+    except (RuntimeError, ValueError) as exc:
+        raise RuntimeError(f"monthly worksheet validation failed: {exc}") from exc
+    return {
+        "source": str(source),
+        "candidate": str(candidate),
+        "sheet_names": candidate_sheet_names,
+        "media_count": len(candidate_media),
+        **sheet_summary,
+    }
 
 
 def sync_workbook(
@@ -535,7 +812,7 @@ def sync_workbook(
         strings = read_shared_strings(archive)
     modified_sheet, report = sync_sheet_xml(sheet_xml, strings, rows, aliases, target_skus)
     if output is not None:
-        fast_patch_zip(source, output, modified_sheet)
+        fast_patch_zip(source, output, {WORKSHEET_PATH: modified_sheet})
     return report
 
 

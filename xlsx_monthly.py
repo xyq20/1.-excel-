@@ -909,6 +909,106 @@ def _cell_value(row: bytes, col: str, shared_strings: list[str]) -> str:
     return _cell_text(cell, shared_strings) if cell is not None else ""
 
 
+def _cell_formula(row: bytes, col: str) -> str | None:
+    cell = next(
+        (candidate for candidate in CELL_RE.finditer(row) if _cell_col(candidate) == col),
+        None,
+    )
+    if cell is None:
+        return None
+    formula = re.search(
+        rb'<(?:[A-Za-z_][\w.-]*:)?f\b[^>]*>(.*?)</(?:[A-Za-z_][\w.-]*:)?f>',
+        cell.group("body") or b"",
+        re.S,
+    )
+    if formula is None:
+        return None
+    return html.unescape(formula.group(1).decode("utf-8", "ignore")).strip()
+
+
+def validate_monthly_sheet(
+    sheet_xml: bytes,
+    shared_strings: list[str],
+    cycle: SyncCycle,
+) -> dict[str, Any]:
+    layout = discover_layout(sheet_xml, shared_strings, cycle)
+    rows = list(ROW_RE.finditer(sheet_xml))
+    header_match = next(
+        (match for match in rows if int(match.group("row")) == layout.header_row),
+        None,
+    )
+    if header_match is None:
+        raise RuntimeError(f"header row {layout.header_row} is missing")
+    header_row = header_match.group(0)
+    found_actual = normalize_header(
+        _cell_value(header_row, layout.actual_col, shared_strings)
+    )
+    expected_actual = normalize_header(actual_header(cycle))
+    if found_actual != expected_actual:
+        raise RuntimeError(
+            f"actual header mismatch: found {found_actual!r}, expected {expected_actual!r}"
+        )
+    found_return = normalize_header(
+        _cell_value(header_row, layout.return_col, shared_strings)
+    )
+    expected_return = normalize_header(return_header(cycle))
+    if found_return != expected_return:
+        raise RuntimeError(
+            f"return header mismatch: found {found_return!r}, expected {expected_return!r}"
+        )
+
+    sku_rows: list[int] = []
+    peer_count = 0
+    change_count = 0
+    for match in rows:
+        row_number = int(match.group("row"))
+        if row_number == layout.header_row:
+            continue
+        row = match.group(0)
+        if not _cell_value(row, "E", shared_strings):
+            continue
+        sku_rows.append(row_number)
+        found_peer = _cell_formula(row, layout.peer_col)
+        expected_peer = peer_formula(layout.previous_col, row_number, cycle)
+        if found_peer != expected_peer:
+            raise RuntimeError(
+                f"peer formula mismatch at row {row_number}: "
+                f"found {found_peer!r}, expected {expected_peer!r}"
+            )
+        peer_count += 1
+        found_change = _cell_formula(row, layout.change_col)
+        expected_change = change_formula(
+            layout.actual_col, layout.peer_col, row_number, cycle
+        )
+        if found_change != expected_change:
+            raise RuntimeError(
+                f"change formula mismatch at row {row_number}: "
+                f"found {found_change!r}, expected {expected_change!r}"
+            )
+        change_count += 1
+
+    return {
+        "row_count": len(rows),
+        "sku_rows": len(sku_rows),
+        "formula_sample_rows": sku_rows[:5],
+        "peer_formula_count": peer_count,
+        "change_formula_count": change_count,
+        "actual_header": found_actual,
+        "return_header": found_return,
+        "layout": {
+            "header_row": layout.header_row,
+            "previous_col": layout.previous_col,
+            "peer_col": layout.peer_col,
+            "actual_col": layout.actual_col,
+            "change_col": layout.change_col,
+            "return_col": layout.return_col,
+            "month_cols": list(layout.month_cols),
+            "needs_insert": layout.needs_insert,
+            "insert_before_col": layout.insert_before_col,
+        },
+    }
+
+
 def _candidate_value(result: Any, field: str) -> Any:
     return result.candidate.get(field, "") if result.candidate else ""
 
