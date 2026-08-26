@@ -1,7 +1,9 @@
 import json
 import unittest
+from urllib.parse import urlparse
 
-from chrome_erp_session import BrowserLoginRequired, ChromeErpSession
+from chrome_erp_session import BrowserLoginRequired, ChromeErpSession, ERP_HOME
+from erp_excel_sync import API_URL
 
 
 class _FakeClient:
@@ -19,6 +21,10 @@ class _FakeClient:
 
 
 class ChromeErpSessionTests(unittest.TestCase):
+    def test_browser_page_and_api_use_the_same_erp_origin(self):
+        self.assertEqual(urlparse(ERP_HOME).netloc, "erp.superboss.cc")
+        self.assertEqual(urlparse(API_URL).netloc, urlparse(ERP_HOME).netloc)
+
     def test_failed_fetch_during_login_navigation_is_retryable(self):
         session = ChromeErpSession()
         session._client = _FakeClient({

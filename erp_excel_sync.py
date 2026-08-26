@@ -34,7 +34,7 @@ from xlsx_monthly import (
 
 
 SHANGHAI_TZ = timezone(timedelta(hours=8))
-API_URL = "https://erpa.superboss.cc/report/sale/dimensions/list"
+API_URL = "https://erp.superboss.cc/report/sale/dimensions/list"
 WORKSHEET_PATH = "xl/worksheets/sheet1.xml"
 MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 RETURN_RATE_FIELD = "customA1ED4F3EEFEF30DBB8E9A9A4823B79A3"

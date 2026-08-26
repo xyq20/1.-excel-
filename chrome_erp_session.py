@@ -18,7 +18,7 @@ from urllib.request import Request, urlopen
 CHROME_EXECUTABLE = Path(
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 )
-ERP_HOME = "https://erpa.superboss.cc/index.html"
+ERP_HOME = "https://erp.superboss.cc/index.html"
 DEBUG_PORT = 9229
 WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -218,7 +218,7 @@ class ChromeErpSession:
                 item
                 for item in targets
                 if item.get("type") == "page"
-                and "erpa.superboss.cc" in item.get("url", "")
+                and item.get("url", "").startswith("https://erp.superboss.cc/")
             ),
             None,
         )
@@ -243,7 +243,7 @@ class ChromeErpSession:
             )
             if (
                 location.get("result", {}).get("value")
-                == "https://erpa.superboss.cc"
+                == "https://erp.superboss.cc"
             ):
                 break
             time.sleep(0.25)
