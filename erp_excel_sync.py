@@ -18,6 +18,8 @@ import zlib
 import zipfile
 from xml.etree import ElementTree as ET
 
+from xlsx_monthly import column_number
+
 
 SHANGHAI_TZ = timezone(timedelta(hours=8))
 API_URL = "https://erpa.superboss.cc/report/sale/dimensions/list"
@@ -191,13 +193,6 @@ def compare_api_snapshots(
                 "changed_fields": fields,
             })
     return report
-
-
-def column_number(col: str) -> int:
-    number = 0
-    for char in col:
-        number = number * 26 + ord(char) - ord("A") + 1
-    return number
 
 
 def set_cell_value(
