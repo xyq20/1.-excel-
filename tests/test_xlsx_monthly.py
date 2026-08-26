@@ -133,6 +133,20 @@ class LayoutDiscoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "同期销量"):
             discover_layout(sheet, [], resolve_sync_cycle(date(2026, 9, 15)))
 
+    def test_malformed_core_column_order_raises_value_error(self):
+        sheet = workbook_sheet(
+            [
+                ("W", "7月实发"),
+                ("X", "同期销量"),
+                ("Y", "8月实发（8.15）"),
+                ("Z", "退货率（7.1-7.31）"),
+                ("AA", "变化情况"),
+            ]
+        )
+
+        with self.assertRaisesRegex(ValueError, "column order"):
+            discover_layout(sheet, [], resolve_sync_cycle(date(2026, 9, 15)))
+
 
 class ReferenceShiftTests(unittest.TestCase):
     def test_formula_translation_leaves_quoted_cell_like_text_unchanged(self):
@@ -299,6 +313,16 @@ class MonthInsertionTests(unittest.TestCase):
         self.assertFalse(result.inserted)
         self.assertEqual(result.sheet_xml, source)
 
+    def test_span_starting_at_insertion_column_keeps_inserted_column_in_span(self):
+        source = august_sheet().replace(
+            b'<row r="2">',
+            b'<row r="2" spans="24:27">',
+        )
+
+        result = insert_month_column(source, [], resolve_sync_cycle(date(2026, 9, 15)))
+
+        self.assertIn(b'<row r="2" spans="24:28">', result.sheet_xml)
+
 
 class WorkbookAndDrawingTests(unittest.TestCase):
     def test_updates_defined_names_and_forces_full_automatic_recalculation(self):
@@ -330,6 +354,13 @@ class WorkbookAndDrawingTests(unittest.TestCase):
             b'<calcPr calcMode="auto" fullCalcOnLoad="1" forceFullCalc="1"/>',
             updated,
         )
+
+    def test_adds_calc_properties_before_ext_list(self):
+        workbook = b'<workbook><sheets/><extLst><ext uri="example"/></extLst></workbook>'
+
+        updated = update_workbook_xml(workbook)
+
+        self.assertLess(updated.index(b"<calcPr "), updated.index(b"<extLst>"))
 
     def test_shifts_drawing_anchor_columns_at_or_right_of_insertion(self):
         drawing = (

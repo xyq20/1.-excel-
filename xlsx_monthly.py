@@ -153,6 +153,17 @@ def discover_layout(
         raise ValueError(f"expected exactly one current actual-sales header, found {len(actual)}")
     previous_col = previous[-1][0]
     actual_col, actual_month = actual[0]
+    ordered_columns = (
+        column_number(previous_col),
+        peer_number,
+        column_number(actual_col),
+        change_number,
+        column_number(return_col),
+    )
+    if ordered_columns != tuple(sorted(ordered_columns)) or len(set(ordered_columns)) != 5:
+        raise ValueError(
+            "invalid header column order; expected previous < peer < actual < change < return"
+        )
 
     expected_month = cycle.actual_month.month
     if cycle.kind == "first":
@@ -280,7 +291,7 @@ def insert_month_column(
 
     def shift_row_span(match: re.Match[bytes]) -> bytes:
         start, end = int(match.group(2)), int(match.group(3))
-        if start >= insert_number:
+        if start > insert_number:
             start += 1
         if end >= insert_number:
             end += 1
@@ -565,8 +576,13 @@ def update_workbook_xml(
         updated = updated[: calc_match.start()] + replacement + updated[calc_match.end() :]
     else:
         replacement = b'<calcPr calcMode="auto" fullCalcOnLoad="1" forceFullCalc="1"/>'
-        closing = updated.rfind(b"</workbook>")
-        if closing < 0:
+        later_child = re.search(
+            rb'<(?:[A-Za-z_][\w.-]*:)?(?:oleSize|customWorkbookViews|pivotCaches|smartTagPr|'
+            rb'smartTagTypes|webPublishing|fileRecoveryPr|webPublishObjects|extLst)\b',
+            updated,
+        )
+        insertion = later_child.start() if later_child else updated.rfind(b"</workbook>")
+        if insertion < 0:
             raise ValueError("workbook XML has no closing workbook element")
-        updated = updated[:closing] + replacement + updated[closing:]
+        updated = updated[:insertion] + replacement + updated[insertion:]
     return updated
