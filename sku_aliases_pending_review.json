@@ -1,0 +1,45 @@
+{
+  "_说明": "以下货号仅作待审核记录，程序不会读取或使用。",
+  "OY-030": {
+    "suggestedErpSku": "OY-030鞋子",
+    "sheetName": "QQ糖",
+    "erpName": "紫罗兰",
+    "reason": "名称不同"
+  },
+  "C6A-1": {
+    "suggestedErpSku": "C6A-",
+    "sheetName": "拯救瑞恩",
+    "erpName": "拯救瑞恩",
+    "reason": "ERP货号疑似缺少1"
+  },
+  "ZSZ100-1": {
+    "suggestedErpSku": "ZSZ100-2",
+    "sheetName": "7A",
+    "erpName": "7A",
+    "reason": "可能是不同链接或款号"
+  },
+  "ZSZ100-3": {
+    "suggestedErpSku": "ZSZ100-2",
+    "sheetName": "7A",
+    "erpName": "7A",
+    "reason": "可能是不同链接或款号"
+  },
+  "OY-222": {
+    "suggestedErpSku": "OY-222-1",
+    "sheetName": "猎鸭",
+    "erpName": "猎户座",
+    "reason": "名称不同"
+  },
+  "NRL088": {
+    "suggestedErpSku": "NRL088-1",
+    "sheetName": "陆战队",
+    "erpName": "陆战队素版",
+    "reason": "可能是不同版本"
+  },
+  "K512、K511": {
+    "suggestedErpSku": "K511鞋子",
+    "sheetName": "话事人",
+    "erpName": "话事人",
+    "reason": "表格单元格包含两个货号"
+  }
+}
