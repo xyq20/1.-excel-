@@ -5,7 +5,7 @@ import html
 import re
 from typing import Callable
 
-from monthly_schedule import SyncCycle, actual_header
+from monthly_schedule import SyncCycle, actual_header, previous_month_start
 
 
 MAX_EXCEL_COLUMN = 16384
@@ -182,6 +182,18 @@ def discover_layout(
             f"{cycle.previous_month.month} or {expected_month}"
         )
 
+    previous_month = previous[-1][1]
+    expected_previous_month = (
+        previous_month_start(cycle.previous_month).month
+        if needs_insert
+        else cycle.previous_month.month
+    )
+    if previous_month != expected_previous_month:
+        raise ValueError(
+            f"previous-month header is month {previous_month}, "
+            f"expected {expected_previous_month}"
+        )
+
     return WorkbookLayout(
         header_row=header_row,
         previous_col=previous_col,
@@ -227,7 +239,47 @@ def _shift_reference_segment(segment: str, insert_number: int) -> str:
     return CELL_REFERENCE_RE.sub(replace, COLUMN_RANGE_RE.sub(replace_column_range, segment))
 
 
-def shift_formula_references(formula: str, insert_before_col: str | int) -> str:
+def _decoded_sheet_name(encoded_sheet: str) -> str:
+    if encoded_sheet.startswith("'"):
+        return encoded_sheet[1:-1].replace("''", "'")
+    return encoded_sheet
+
+
+def _shift_formula_segment(
+    segment: str,
+    insert_number: int,
+    target_sheet: str,
+    shift_unqualified: bool,
+) -> str:
+    protected: list[str] = []
+
+    def protect(value: str) -> str:
+        token = f"\ue000{len(protected)}\ue001"
+        protected.append(value)
+        return token
+
+    def replace_qualified(match: re.Match[str]) -> str:
+        reference = match.group("reference")
+        if _decoded_sheet_name(match.group("sheet")) == target_sheet:
+            reference = _shift_reference_segment(reference, insert_number)
+        return protect(match.group("sheet") + "!" + reference)
+
+    masked = QUALIFIED_REFERENCE_RE.sub(replace_qualified, segment)
+    masked = re.sub(r"'(?:[^']|'')*'", lambda match: protect(match.group(0)), masked)
+    if shift_unqualified:
+        masked = _shift_reference_segment(masked, insert_number)
+    for index, value in enumerate(protected):
+        masked = masked.replace(f"\ue000{index}\ue001", value)
+    return masked
+
+
+def shift_formula_references(
+    formula: str,
+    insert_before_col: str | int,
+    target_sheet: str = "分级总表",
+    *,
+    shift_unqualified: bool = True,
+) -> str:
     insert_number = (
         column_number(insert_before_col)
         if isinstance(insert_before_col, str)
@@ -241,10 +293,17 @@ def shift_formula_references(formula: str, insert_before_col: str | int) -> str:
     index = 0
     while index < len(formula):
         quote = formula[index]
-        if quote not in {'"', "'"}:
+        if quote != '"':
             index += 1
             continue
-        output.append(_shift_reference_segment(formula[start:index], insert_number))
+        output.append(
+            _shift_formula_segment(
+                formula[start:index],
+                insert_number,
+                target_sheet,
+                shift_unqualified,
+            )
+        )
         end = index + 1
         while end < len(formula):
             if formula[end] != quote:
@@ -258,7 +317,14 @@ def shift_formula_references(formula: str, insert_before_col: str | int) -> str:
         output.append(formula[index:end])
         index = end
         start = end
-    output.append(_shift_reference_segment(formula[start:], insert_number))
+    output.append(
+        _shift_formula_segment(
+            formula[start:],
+            insert_number,
+            target_sheet,
+            shift_unqualified,
+        )
+    )
     return "".join(output)
 
 
@@ -524,42 +590,72 @@ def shift_drawing_anchors(drawing_xml: bytes, insert_before_col: str | int) -> b
     return re.sub(rb'(<(?:[A-Za-z_][\w.-]*:)?col>)(\d+)(</(?:[A-Za-z_][\w.-]*:)?col>)', shift, drawing_xml)
 
 
+def shift_qualified_worksheet_formulas(
+    sheet_xml: bytes,
+    insert_before_col: str | int,
+    target_sheet: str = "分级总表",
+) -> bytes:
+    def shift_formula(match: re.Match[bytes]) -> bytes:
+        formula = html.unescape(match.group(2).decode("utf-8", "ignore"))
+        shifted = shift_formula_references(
+            formula,
+            insert_before_col,
+            target_sheet,
+            shift_unqualified=False,
+        )
+        return (
+            match.group(1)
+            + html.escape(shifted, quote=False).encode("utf-8")
+            + match.group(3)
+        )
+
+    formula_tag = rb'(?:[A-Za-z_][\w.-]*:)?(?:formula[12]?|f)'
+    return re.sub(
+        rb'(<'+ formula_tag + rb'\b(?![^>]*?/\s*>)[^>]*>)(.*?)(</' + formula_tag + rb'>)',
+        shift_formula,
+        sheet_xml,
+        flags=re.S,
+    )
+
+
 def update_workbook_xml(
     workbook_xml: bytes,
     insert_before_col: str | int | None = None,
     sheet_name: str = "分级总表",
 ) -> bytes:
     updated = workbook_xml
+    root_match = re.search(
+        rb'<(?P<prefix>[A-Za-z_][\w.-]*:)?workbook\b',
+        updated,
+    )
+    if root_match is None:
+        raise ValueError("workbook XML has no workbook root element")
+    workbook_prefix = root_match.group("prefix") or b""
     if insert_before_col is not None:
         def shift_name(match: re.Match[bytes]) -> bytes:
             value = html.unescape(match.group(2).decode("utf-8", "ignore"))
-
-            def shift_qualified(reference: re.Match[str]) -> str:
-                encoded_sheet = reference.group("sheet")
-                decoded_sheet = (
-                    encoded_sheet[1:-1].replace("''", "'")
-                    if encoded_sheet.startswith("'")
-                    else encoded_sheet
-                )
-                if decoded_sheet != sheet_name:
-                    return reference.group(0)
-                shifted_reference = shift_formula_references(
-                    reference.group("reference"),
-                    insert_before_col,
-                )
-                return encoded_sheet + "!" + shifted_reference
-
-            shifted = QUALIFIED_REFERENCE_RE.sub(shift_qualified, value)
+            shifted = shift_formula_references(
+                value,
+                insert_before_col,
+                sheet_name,
+                shift_unqualified=False,
+            )
             return match.group(1) + html.escape(shifted, quote=False).encode("utf-8") + match.group(3)
 
         updated = re.sub(
-            rb'(<definedName\b[^>]*>)(.*?)(</definedName>)',
+            rb'(<(?:[A-Za-z_][\w.-]*:)?definedName\b[^>]*>)(.*?)'
+            rb'(</(?:[A-Za-z_][\w.-]*:)?definedName>)',
             shift_name,
             updated,
             flags=re.S,
         )
 
-    calc_match = re.search(rb'<calcPr\b[^>]*(?:/>|>.*?</calcPr>)', updated, re.S)
+    calc_match = re.search(
+        rb'<(?P<prefix>[A-Za-z_][\w.-]*:)?calcPr\b[^>]*'
+        rb'(?:/>|>.*?</(?:[A-Za-z_][\w.-]*:)?calcPr>)',
+        updated,
+        re.S,
+    )
     required = {
         "calcMode": "auto",
         "fullCalcOnLoad": "1",
@@ -572,16 +668,27 @@ def update_workbook_xml(
             f'{key}="{html.escape(value, quote=True)}"'
             for key, value in attrs.items()
         ]
-        replacement = ("<calcPr " + " ".join(pieces) + "/>").encode("utf-8")
+        replacement = (
+            b"<"
+            + workbook_prefix
+            + b"calcPr "
+            + " ".join(pieces).encode("utf-8")
+            + b"/>"
+        )
         updated = updated[: calc_match.start()] + replacement + updated[calc_match.end() :]
     else:
-        replacement = b'<calcPr calcMode="auto" fullCalcOnLoad="1" forceFullCalc="1"/>'
+        replacement = (
+            b"<"
+            + workbook_prefix
+            + b'calcPr calcMode="auto" fullCalcOnLoad="1" forceFullCalc="1"/>'
+        )
         later_child = re.search(
             rb'<(?:[A-Za-z_][\w.-]*:)?(?:oleSize|customWorkbookViews|pivotCaches|smartTagPr|'
             rb'smartTagTypes|webPublishing|fileRecoveryPr|webPublishObjects|extLst)\b',
             updated,
         )
-        insertion = later_child.start() if later_child else updated.rfind(b"</workbook>")
+        closing_tag = b"</" + workbook_prefix + b"workbook>"
+        insertion = later_child.start() if later_child else updated.rfind(closing_tag)
         if insertion < 0:
             raise ValueError("workbook XML has no closing workbook element")
         updated = updated[:insertion] + replacement + updated[insertion:]

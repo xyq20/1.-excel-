@@ -13,6 +13,7 @@ from xlsx_monthly import (
     normalize_header,
     shift_drawing_anchors,
     shift_formula_references,
+    shift_qualified_worksheet_formulas,
     update_workbook_xml,
 )
 
@@ -147,6 +148,20 @@ class LayoutDiscoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "column order"):
             discover_layout(sheet, [], resolve_sync_cycle(date(2026, 9, 15)))
 
+    def test_partial_already_rolled_layout_rejects_stale_previous_month(self):
+        sheet = workbook_sheet(
+            [
+                ("W", "7月实发"),
+                ("X", "同期销量"),
+                ("Y", "9月实发（9.15）"),
+                ("Z", "变化情况"),
+                ("AA", "退货率（8.1-8.31）"),
+            ]
+        )
+
+        with self.assertRaisesRegex(ValueError, "previous-month"):
+            discover_layout(sheet, [], resolve_sync_cycle(date(2026, 9, 15)))
+
 
 class ReferenceShiftTests(unittest.TestCase):
     def test_formula_translation_leaves_quoted_cell_like_text_unchanged(self):
@@ -160,16 +175,38 @@ class ReferenceShiftTests(unittest.TestCase):
     def test_formula_translation_does_not_treat_numbered_function_names_as_cells(self):
         self.assertEqual(shift_formula_references("LOG10(X2)", "X"), "LOG10(Y2)")
 
-    def test_formula_translation_preserves_quoted_sheet_names(self):
+    def test_formula_translation_leaves_non_target_sheet_references_unchanged(self):
         self.assertEqual(
-            shift_formula_references("SUM('Y2 data'!X2)", "X"),
-            "SUM('Y2 data'!Y2)",
+            shift_formula_references("X2+OtherSheet!X2+'Other Sheet'!$X$2", "X"),
+            "Y2+OtherSheet!X2+'Other Sheet'!$X$2",
+        )
+
+    def test_formula_translation_shifts_target_sheet_qualified_references(self):
+        self.assertEqual(
+            shift_formula_references("分级总表!X2+'分级总表'!$X$2", "X"),
+            "分级总表!Y2+'分级总表'!$Y$2",
         )
 
     def test_formula_translation_shifts_whole_column_ranges(self):
         self.assertEqual(
             shift_formula_references('FILTER($AS:$AS,$AR:$AR=F4)+SUM("$X:$X")', "X"),
             'FILTER($AT:$AT,$AS:$AS=F4)+SUM("$X:$X")',
+        )
+
+    def test_cross_sheet_helper_only_shifts_qualified_target_references(self):
+        sheet = (
+            b'<worksheet><sheetData><row r="1"><c r="A1"><f>'
+            b'X2+\xe5\x88\x86\xe7\xba\xa7\xe6\x80\xbb\xe8\xa1\xa8!X2+OtherSheet!X2+'
+            b'&apos;\xe5\x88\x86\xe7\xba\xa7\xe6\x80\xbb\xe8\xa1\xa8&apos;!$X$2'
+            b'</f></c></row></sheetData></worksheet>'
+        )
+
+        shifted = shift_qualified_worksheet_formulas(sheet, "X")
+
+        self.assertIn(
+            b'X2+\xe5\x88\x86\xe7\xba\xa7\xe6\x80\xbb\xe8\xa1\xa8!Y2+OtherSheet!X2+'
+            b"'\xe5\x88\x86\xe7\xba\xa7\xe6\x80\xbb\xe8\xa1\xa8'!$Y$2",
+            shifted,
         )
 
 
@@ -361,6 +398,24 @@ class WorkbookAndDrawingTests(unittest.TestCase):
         updated = update_workbook_xml(workbook)
 
         self.assertLess(updated.index(b"<calcPr "), updated.index(b"<extLst>"))
+
+    def test_updates_and_inserts_calc_properties_with_workbook_prefix(self):
+        existing = (
+            b'<x:workbook xmlns:x="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            b'<x:sheets/><x:calcPr calcMode="manual"/><x:extLst/></x:workbook>'
+        )
+        missing = (
+            b'<x:workbook xmlns:x="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            b'<x:sheets/><x:extLst/></x:workbook>'
+        )
+
+        updated_existing = update_workbook_xml(existing)
+        updated_missing = update_workbook_xml(missing)
+
+        self.assertIn(b'<x:calcPr calcMode="auto"', updated_existing)
+        self.assertIn(b'<x:calcPr calcMode="auto"', updated_missing)
+        self.assertNotIn(b'<calcPr ', updated_existing)
+        self.assertNotIn(b'<calcPr ', updated_missing)
 
     def test_shifts_drawing_anchor_columns_at_or_right_of_insertion(self):
         drawing = (
