@@ -1,0 +1,14 @@
+{
+  "start_date": "2026-08-01",
+  "end_date": "2026-08-20",
+  "input": "outputs/26年8月分级总表_API同步.xlsx",
+  "output": "outputs/26年8月分级总表_API再次同步.xlsx",
+  "company_id": "111873",
+  "cookie_env": "ERP_COOKIE",
+  "skus_file": "target_skus.txt",
+  "aliases": "sku_aliases.json",
+  "previous_json": "erp_dimensions.json",
+  "snapshot": "erp_dimensions_latest.json",
+  "report_dir": "reports",
+  "dry_run": false
+}

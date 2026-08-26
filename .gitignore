@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+node_modules/
+.DS_Store
+
+# Large generated workbooks and API snapshots
+*.xlsx
+outputs/
+reports/
+erp_dimensions*.json
+match_log.json
+
+# Local isolated worktrees
+.worktrees/
