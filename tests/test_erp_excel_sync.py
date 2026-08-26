@@ -126,7 +126,7 @@ class DateWindowTests(unittest.TestCase):
         self.assertEqual(payload["queryFlag"], "item")
         self.assertEqual(payload["pageSize"], "2000")
         self.assertEqual(payload["sysStatus"], "created")
-        self.assertEqual(payload["tradeTypes"], "")
+        self.assertEqual(payload["tradeTypes"], "3")
         self.assertEqual(payload["asStatus"], "9,2,12")
 
 

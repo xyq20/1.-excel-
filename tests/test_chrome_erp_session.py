@@ -2,12 +2,14 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 from urllib.parse import urlparse
 
 from chrome_erp_session import (
     BrowserLoginRequired,
     ChromeErpSession,
     ERP_HOME,
+    _close_extra_page_targets,
     _enable_session_restore,
 )
 from erp_excel_sync import API_URL
@@ -42,6 +44,18 @@ class ChromeErpSessionTests(unittest.TestCase):
     def test_browser_page_and_api_use_the_same_erp_origin(self):
         self.assertEqual(urlparse(ERP_HOME).netloc, "erp.superboss.cc")
         self.assertEqual(urlparse(API_URL).netloc, urlparse(ERP_HOME).netloc)
+
+    @mock.patch("chrome_erp_session._debug_json")
+    def test_only_one_erp_page_is_kept(self, debug_json):
+        targets = [
+            {"type": "page", "id": "erp"},
+            {"type": "page", "id": "old-page"},
+            {"type": "service_worker", "id": "worker"},
+        ]
+
+        _close_extra_page_targets(targets, "erp")
+
+        debug_json.assert_called_once_with("/json/close/old-page")
 
     def test_failed_fetch_during_login_navigation_is_retryable(self):
         session = ChromeErpSession()

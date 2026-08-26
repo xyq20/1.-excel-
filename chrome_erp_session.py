@@ -192,6 +192,25 @@ def _enable_session_restore(profile: Path) -> None:
     os.replace(temporary, preferences_path)
 
 
+def _close_extra_page_targets(
+    targets: list[dict[str, Any]],
+    keep_target_id: str,
+) -> None:
+    """Keep one ERP page so restored tabs do not grow on every run."""
+    for item in targets:
+        target_id = item.get("id")
+        if (
+            item.get("type") != "page"
+            or not isinstance(target_id, str)
+            or target_id == keep_target_id
+        ):
+            continue
+        try:
+            _debug_json(f"/json/close/{target_id}")
+        except (OSError, URLError, ValueError):
+            pass
+
+
 class ChromeErpSession:
     def __init__(self) -> None:
         self._client: _CdpWebSocket | None = None
@@ -220,7 +239,6 @@ class ChromeErpSession:
                     "--no-first-run",
                     "--no-default-browser-check",
                     "--restore-last-session",
-                    ERP_HOME,
                 ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -254,6 +272,9 @@ class ChromeErpSession:
                 "/json/new?" + ERP_HOME,
                 method="PUT",
             )
+        target_id = target.get("id")
+        if isinstance(target_id, str):
+            _close_extra_page_targets(targets, target_id)
         websocket_url = target.get("webSocketDebuggerUrl")
         if not websocket_url:
             raise RuntimeError("Chrome ERP tab has no debugger connection")

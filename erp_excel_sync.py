@@ -50,7 +50,7 @@ CELL_RE = re.compile(
 ROW_RE = re.compile(rb'<row\b[^>]*\br="(\d+)"[^>]*>.*?</row>', re.S)
 BASE_FORM_BODY = (
     "pageNo=1&pageSize=2000&shouldSort=false&sortField=&sortType=&pageId=1302&queryFlag=item&"
-    "startTime=&endTime=&sysStatus=created&sellerFlags=&tradeTypes=&excludeTradeTypes=&"
+    "startTime=&endTime=&sysStatus=created&sellerFlags=&tradeTypes=3&excludeTradeTypes=&"
     "containTagIds=&exceptTagIds=&containType=1&exceptType=1&subTagIdsQueryFlag=false&userIds=&"
     "shopUkList=&warehouseIds=&isAccurate=&itemFlag=0&tradeSysStatus=&scalping=&sysSkuIds=&"
     "sysItemIds=&outerIds=&numIids=&platformItemIdQueryFlag=0&platformItemNames=&"
