@@ -552,11 +552,31 @@ def _number_text(value: float) -> str:
     return ("%.10f" % value).rstrip("0").rstrip(".") or "0"
 
 
+def _cell_style(row: bytes, col: str) -> str | None:
+    existing = next(
+        (cell for cell in CELL_RE.finditer(row) if _cell_col(cell) == col),
+        None,
+    )
+    if existing is None:
+        return None
+    style = re.search(rb'\bs="([^"]+)"', existing.group(0).split(b">", 1)[0])
+    return style.group(1).decode("ascii") if style else None
+
+
+def _apply_cell_style(opening: bytes, style: str | None) -> bytes:
+    if style is None:
+        return opening
+    opening = re.sub(rb'\s+s="[^"]*"', b"", opening)
+    return opening + b' s="' + style.encode("ascii") + b'"'
+
+
 def _set_cell_number(
     row: bytes,
     col: str,
     row_number: int,
     value: str,
+    *,
+    style: str | None = None,
 ) -> bytes:
     existing = next(
         (cell for cell in CELL_RE.finditer(row) if _cell_col(cell) == col),
@@ -568,11 +588,18 @@ def _set_cell_number(
         opening = existing.group(0).split(b">", 1)[0].rstrip(b"/")
         opening = re.sub(rb'\s+t="[^"]*"', b"", opening)
         opening = re.sub(rb'\s+vm="[^"]*"', b"", opening)
+    opening = _apply_cell_style(opening, style)
     cell = opening + b"><v>" + value.encode("ascii") + b"</v></c>"
     return _insert_or_replace_cell(row, col, row_number, cell)
 
 
-def _clear_cell_value(row: bytes, col: str, row_number: int) -> bytes:
+def _clear_cell_value(
+    row: bytes,
+    col: str,
+    row_number: int,
+    *,
+    style: str | None = None,
+) -> bytes:
     existing = next(
         (cell for cell in CELL_RE.finditer(row) if _cell_col(cell) == col),
         None,
@@ -583,6 +610,7 @@ def _clear_cell_value(row: bytes, col: str, row_number: int) -> bytes:
         opening = existing.group(0).split(b">", 1)[0].rstrip(b"/")
         opening = re.sub(rb'\s+t="[^"]*"', b"", opening)
         opening = re.sub(rb'\s+vm="[^"]*"', b"", opening)
+    opening = _apply_cell_style(opening, style)
     return _insert_or_replace_cell(
         row, col, row_number, opening + b"/>",
     )
@@ -623,6 +651,22 @@ def _formula_column_style(sheet_xml: bytes, col: str) -> str | None:
         if style:
             styles.append(style.group(1).decode("ascii"))
     return Counter(styles).most_common(1)[0][0] if styles else None
+
+
+def _column_style(sheet_xml: bytes, col: str) -> str | None:
+    styles: list[str] = []
+    for cell in CELL_RE.finditer(sheet_xml):
+        if _cell_col(cell) != col:
+            continue
+        if re.search(rb'\bt="(?:inlineStr|s)"', cell.group(0).split(b">", 1)[0]):
+            continue
+        style = re.search(rb'\bs="(\d+)"', cell.group(0).split(b">", 1)[0])
+        if style:
+            styles.append(style.group(1).decode("ascii"))
+    if not styles:
+        return None
+    style, count = Counter(styles).most_common(1)[0]
+    return style if count > len(styles) / 2 else None
 
 
 def _extend_change_conditional_formatting(
@@ -773,6 +817,9 @@ def apply_monthly_values(
     change_formula_style = _formula_column_style(
         insertion.sheet_xml, layout.change_col
     )
+    dominant_return_percentage_style = _column_style(
+        insertion.sheet_xml, layout.return_col
+    )
 
     def update_row(match: re.Match[bytes]) -> bytes:
         nonlocal formula_count
@@ -868,12 +915,18 @@ def apply_monthly_values(
                 status=actual_status,
             ))
 
+        return_percentage_style = (
+            dominant_return_percentage_style
+            or _cell_style(row, layout.return_col)
+        )
+
         def update_return_rate(
             result: Any,
             value_field: str,
             col: str,
             field_name: str,
             old_value: str,
+            style: str | None = None,
         ) -> tuple[bytes, str, str, bool]:
             current_row = row
             status = result.status
@@ -903,10 +956,16 @@ def apply_monthly_values(
                         status = "invalid_value"
                     else:
                         current_row = _set_cell_number(
-                            current_row, col, row_number, new_value
+                            current_row,
+                            col,
+                            row_number,
+                            new_value,
+                            style=style,
                         )
             if not new_value:
-                current_row = _clear_cell_value(current_row, col, row_number)
+                current_row = _clear_cell_value(
+                    current_row, col, row_number, style=style
+                )
             if new_value != old_value:
                 changed.append(field_name)
             if not match_ok or status == "invalid_value":
@@ -927,9 +986,15 @@ def apply_monthly_values(
                 layout.before_return_col,
                 "before_return",
                 old_before_return,
+                return_percentage_style,
             )
         )
-        row = _clear_cell_value(row, layout.after_return_col, row_number)
+        row = _clear_cell_value(
+            row,
+            layout.after_return_col,
+            row_number,
+            style=return_percentage_style,
+        )
         if old_after_return:
             changed.append("after_return")
         row, new_return, return_status, return_match_ok = update_return_rate(
@@ -938,6 +1003,7 @@ def apply_monthly_values(
             layout.return_col,
             "return",
             old_return,
+            return_percentage_style,
         )
 
         row = _set_cell_formula(

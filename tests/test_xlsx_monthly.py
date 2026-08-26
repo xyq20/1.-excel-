@@ -906,6 +906,43 @@ class MonthlyValueWriteTests(unittest.TestCase):
         self.assertEqual(result.rows[0]["return_status"], "below_threshold")
         self.assertTrue(result.critical_results[0]["passed"])
 
+    def test_before_and_after_columns_copy_overall_percentage_style(self):
+        sheet = self._sheet().replace(
+            b'<c r="AA2" s="219"><v>0.25</v></c>',
+            b'<c r="AA2" s="170"><v>0.25</v></c>',
+        ).replace(
+            b'<c r="AB2" s="219"><v>0.3</v></c>',
+            b'<c r="AB2" s="170"><v>0.3</v></c>',
+        ).replace(
+            b'<c r="AC2" s="219"><v>0.25</v></c>',
+            b'<c r="AC2" s="178"><v>0.25</v></c>',
+        )
+        before_rows = [{
+            "itemOuterId": "A-1",
+            "title": "Alpha",
+            "itemCount": 50,
+            BEFORE_RETURN_FIELD: "25.00%",
+        }]
+        overall_rows = [{
+            "itemOuterId": "A-1",
+            "title": "Alpha",
+            "itemCount": 50,
+            OVERALL_RETURN_FIELD: "50.00%",
+        }]
+
+        result = self._apply(
+            sheet,
+            resolve_sync_cycle(date(2026, 8, 15)),
+            [],
+            [],
+            before_return_rows=before_rows,
+            overall_return_rows=overall_rows,
+        )
+
+        self.assertIn(b'<c r="AA2" s="178"><v>0.25</v></c>', result.sheet_xml)
+        self.assertIn(b'<c r="AB2" s="178"/>', result.sheet_xml)
+        self.assertIn(b'<c r="AC2" s="178"><v>0.5</v></c>', result.sheet_xml)
+
     def test_updates_every_sheet_sku_row_even_when_not_critical(self):
         cycle = resolve_sync_cycle(date(2026, 8, 15))
         actual_rows = [
