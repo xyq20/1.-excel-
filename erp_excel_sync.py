@@ -35,7 +35,14 @@ from xlsx_monthly import (
 
 
 SHANGHAI_TZ = timezone(timedelta(hours=8))
-API_URL = "https://erp.superboss.cc/report/sale/dimensions/list"
+API_URL = "https://erpa.superboss.cc/report/sale/dimensions/list"
+LOGIN_ERROR_MARKERS = (
+    "登录",
+    "登陆",
+    "未认证",
+    "会话",
+    "session",
+)
 WORKSHEET_PATH = "xl/worksheets/sheet1.xml"
 MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 RETURN_RATE_FIELD = "customA1ED4F3EEFEF30DBB8E9A9A4823B79A3"
@@ -51,6 +58,10 @@ CELL_RE = re.compile(
     re.S,
 )
 ROW_RE = re.compile(rb'<row\b[^>]*\br="(\d+)"[^>]*>.*?</row>', re.S)
+MONTHLY_WORKBOOK_RE = re.compile(
+    r"^(?P<year>\d{2}|\d{4})年(?P<month>1[0-2]|[1-9])月(?P<suffix>.+\.xlsx)$",
+    re.IGNORECASE,
+)
 BASE_FORM_BODY = (
     "pageNo=1&pageSize=2000&shouldSort=false&sortField=&sortType=&pageId=1302&queryFlag=item&"
     "startTime=&endTime=&sysStatus=created&sellerFlags=&tradeTypes=3&excludeTradeTypes=&"
@@ -284,6 +295,8 @@ def set_cell_value(
         opening = match.group(0).split(b">", 1)[0].rstrip(b"/")
         opening = re.sub(rb'\s+t="[^"]*"', b"", opening)
         opening = re.sub(rb'\s+vm="[^"]*"', b"", opening)
+        if default_style is not None and not re.search(rb'\s+s="[^"]*"', opening):
+            opening += b' s="' + default_style.encode("ascii") + b'"'
         replacement = opening + b"><v>" + encoded_value + b"</v></c>"
         return row_bytes[: match.start()] + replacement + row_bytes[match.end() :]
 
@@ -480,7 +493,7 @@ def fetch_api_via_chrome(
     company_id: str,
     start_date: str,
     end_date: str,
-    login_timeout: int = 600,
+    login_timeout: int | None = None,
     *,
     as_types: tuple[str, ...] = (),
 ) -> dict[str, Any]:
@@ -489,8 +502,30 @@ def fetch_api_via_chrome(
     rows: list[dict[str, Any]] = []
     first_response: dict[str, Any] | None = None
     page_number = 1
-    login_deadline = time_module.monotonic() + login_timeout
+    login_deadline = (
+        time_module.monotonic() + login_timeout
+        if login_timeout is not None
+        else None
+    )
     login_message_shown = False
+
+    def wait_for_login() -> None:
+        nonlocal login_message_shown
+        if (
+            login_deadline is not None
+            and time_module.monotonic() >= login_deadline
+        ):
+            raise RuntimeError("Timed out waiting for ERP browser login")
+        if not login_message_shown:
+            session.show_login_window()
+            print(
+                "ERP登录已失效。请在Chrome中重新登录；程序会持续等待，"
+                "登录成功后自动继续。",
+                flush=True,
+            )
+            login_message_shown = True
+        time_module.sleep(2)
+
     while True:
         payload["pageNo"] = str(page_number)
         headers = {
@@ -507,28 +542,13 @@ def fetch_api_via_chrome(
                 urlencode(payload),
             )
         except BrowserLoginRequired:
-            if time_module.monotonic() >= login_deadline:
-                raise RuntimeError("Timed out waiting for ERP browser login")
-            if not login_message_shown:
-                print(
-                    "ERP登录窗口已打开。请在Chrome中完成登录，登录成功后程序会自动继续。",
-                    flush=True,
-                )
-                login_message_shown = True
-            time_module.sleep(2)
+            wait_for_login()
             continue
         if result.get("result") != 1 and not result.get("suc"):
             message = result.get("message") or result.get("msg") or "unknown API error"
-            if any(keyword in str(message) for keyword in ("登录", "登陆", "未认证", "session")):
-                if time_module.monotonic() >= login_deadline:
-                    raise RuntimeError("Timed out waiting for ERP browser login")
-                if not login_message_shown:
-                    print(
-                        "ERP登录窗口已打开。请在Chrome中完成登录，登录成功后程序会自动继续。",
-                        flush=True,
-                    )
-                    login_message_shown = True
-                time_module.sleep(2)
+            folded_message = str(message).casefold()
+            if any(marker in folded_message for marker in LOGIN_ERROR_MARKERS):
+                wait_for_login()
                 continue
             raise RuntimeError(f"ERP API rejected the request: {message}")
         if first_response is None:
@@ -876,20 +896,82 @@ def create_same_directory_temp(master: Path) -> Path:
     return Path(name)
 
 
+def monthly_workbook_path(workbook: Path, actual_month: date) -> Path:
+    workbook = Path(workbook)
+    match = MONTHLY_WORKBOOK_RE.fullmatch(workbook.name)
+    if match is None:
+        return workbook
+    year = (
+        f"{actual_month.year % 100:02d}"
+        if len(match.group("year")) == 2
+        else f"{actual_month.year:04d}"
+    )
+    return workbook.with_name(
+        f'{year}年{actual_month.month}月{match.group("suffix")}'
+    )
+
+
+def _monthly_workbook_family(match: re.Match[str]) -> str:
+    return re.sub(
+        r"_API同步(?=\.xlsx$)",
+        "",
+        match.group("suffix"),
+        flags=re.IGNORECASE,
+    ).casefold()
+
+
+def resolve_monthly_workbook(workbook: Path, actual_month: date) -> tuple[Path, Path]:
+    workbook = Path(workbook)
+    target = monthly_workbook_path(workbook, actual_month)
+    match = MONTHLY_WORKBOOK_RE.fullmatch(workbook.name)
+    if match is None:
+        return workbook, target
+
+    target_key = (actual_month.year, actual_month.month)
+    candidates: list[tuple[tuple[int, int], Path]] = []
+    if workbook.parent.exists():
+        for candidate in workbook.parent.iterdir():
+            candidate_match = MONTHLY_WORKBOOK_RE.fullmatch(candidate.name)
+            if candidate_match is None or not candidate.is_file():
+                continue
+            if _monthly_workbook_family(candidate_match) != _monthly_workbook_family(match):
+                continue
+            raw_year = candidate_match.group("year")
+            year = int(raw_year)
+            if len(raw_year) == 2:
+                year += 2000
+            key = (year, int(candidate_match.group("month")))
+            if key <= target_key:
+                candidates.append((key, candidate))
+
+    if candidates:
+        source = max(candidates, key=lambda item: item[0])[1]
+        return source, monthly_workbook_path(source, actual_month)
+    return workbook, target
+
+
 def atomic_replace_master(
     master: Path,
     validated_temp: Path,
+    target: Path | None = None,
     replace=os.replace,
 ) -> Path:
     master = Path(master)
     validated_temp = Path(validated_temp)
-    backup = master.with_suffix(master.suffix + ".bak")
+    target = Path(target) if target is not None else master
+    backup = target.with_suffix(target.suffix + ".bak")
     replace(master, backup)
     try:
-        replace(validated_temp, master)
+        replace(validated_temp, target)
     except BaseException:
         replace(backup, master)
         raise
+    previous_backup = master.with_suffix(master.suffix + ".bak")
+    if previous_backup != backup:
+        try:
+            previous_backup.unlink(missing_ok=True)
+        except OSError as exc:
+            print(f"警告：旧月份备份未能清理：{previous_backup}（{exc}）", file=sys.stderr)
     return backup
 
 
@@ -1187,11 +1269,18 @@ def _monthly_report_rows(
 def run_monthly_sync(args: argparse.Namespace, run_date: date | None = None) -> int:
     run_date = run_date or datetime.now(SHANGHAI_TZ).date()
     cycle = resolve_sync_cycle(run_date)
-    workbook = Path(args.workbook) if args.workbook is not None else None
-    if workbook is None:
+    configured_workbook = Path(args.workbook) if args.workbook is not None else None
+    if configured_workbook is None:
         raise SystemExit("Master workbook is required; set workbook in config.json or pass --workbook")
+    workbook, target_workbook = resolve_monthly_workbook(
+        configured_workbook,
+        cycle.actual_month,
+    )
     if not workbook.exists():
-        raise SystemExit(f"Master workbook not found: {workbook}")
+        raise SystemExit(
+            "Master workbook not found: "
+            f"{workbook} (configured naming template: {configured_workbook})"
+        )
     before_return_json = getattr(args, "before_return_json", None)
     after_return_json = getattr(args, "after_return_json", None)
     offline_inputs = (
@@ -1461,7 +1550,8 @@ def run_monthly_sync(args: argparse.Namespace, run_date: date | None = None) -> 
         "manualReviewRows": len(prepared.review),
         "criticalFailures": len(prepared.critical_failures),
         "dryRun": bool(args.dry_run),
-        "workbook": str(workbook),
+        "sourceWorkbook": str(workbook),
+        "workbook": str(target_workbook),
         "backup": None,
         "validation": None,
     }
@@ -1478,7 +1568,7 @@ def run_monthly_sync(args: argparse.Namespace, run_date: date | None = None) -> 
     try:
         fast_patch_zip(workbook, candidate, prepared.replacements)
         summary["validation"] = validate_workbook(workbook, candidate, cycle)
-        backup = atomic_replace_master(workbook, candidate)
+        backup = atomic_replace_master(workbook, candidate, target=target_workbook)
         summary["backup"] = str(backup)
     except BaseException:
         summary["candidate"] = str(candidate)

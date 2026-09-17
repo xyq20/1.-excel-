@@ -1,6 +1,6 @@
 {
-  "_说明": "只维护 workbook 路径；Mac 会自动打开 Chrome 使用网页登录会话，无需粘贴 Cookie。日期窗口自动计算，target_skus.txt 仅做关键货号校验。",
-  "workbook": "outputs/26年8月分级总表_API同步.xlsx",
+  "_说明": "workbook 是首次主表和月份命名模板；程序会按实发归属月自动寻找并改名，无需每月修改。Mac/Windows 会自动打开 Chrome 使用网页登录会话，无需粘贴 Cookie。日期窗口自动计算，target_skus.txt 仅做关键货号校验。",
+  "workbook": "outputs/26年9月分级总表.xlsx",
   "company_id": "111873",
   "cookie_env": "ERP_COOKIE",
   "browser_login": true,

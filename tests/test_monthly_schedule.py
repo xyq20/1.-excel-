@@ -97,7 +97,26 @@ class HeaderAndFormulaTests(unittest.TestCase):
     def test_peer_formula_uses_leap_february_day_count(self):
         cycle = resolve_sync_cycle(date(2024, 3, 15))
 
-        self.assertEqual(peer_formula("X", 9, cycle), "X9/29*14")
+        self.assertEqual(peer_formula("X", 9, cycle), "ROUND(X9/29*14,0)")
+
+    def test_fifteenth_peer_formula_tracks_28_30_and_31_day_previous_months(self):
+        cases = (
+            (date(2026, 3, 15), 28),
+            (date(2026, 5, 15), 30),
+            (date(2026, 6, 15), 31),
+        )
+        for run_date, days in cases:
+            with self.subTest(run_date=run_date):
+                cycle = resolve_sync_cycle(run_date)
+                self.assertEqual(
+                    peer_formula("X", 9, cycle),
+                    f"ROUND(X9/{days}*14,0)",
+                )
+
+    def test_first_node_peer_formula_keeps_dynamic_month_day_count_unrounded(self):
+        cycle = resolve_sync_cycle(date(2026, 9, 1))
+
+        self.assertEqual(peer_formula("W", 9, cycle), "W9/31*14")
 
     def test_current_month_change_formula_matches_approved_text_exactly(self):
         cycle = resolve_sync_cycle(date(2026, 10, 15))
@@ -105,6 +124,14 @@ class HeaderAndFormulaTests(unittest.TestCase):
         self.assertEqual(
             change_formula("AA", "Z", 9, cycle),
             'TEXT(AA9-Z9,"10月增加0件；10月减少0件；持平")',
+        )
+
+    def test_first_node_change_formula_can_compare_actual_to_previous_actual(self):
+        cycle = resolve_sync_cycle(date(2026, 9, 1))
+
+        self.assertEqual(
+            change_formula("Y", "W", 4, cycle),
+            'TEXT(Y4-W4,"8月增加0件；8月减少0件；持平")',
         )
 
 

@@ -9,12 +9,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from chrome_erp_session import BrowserLoginRequired
 from erp_excel_sync import (
     build_payload,
     changed_fields,
     choose_candidate,
     compare_api_snapshots,
     date_window_ms,
+    fetch_api_via_chrome,
     parse_runtime_args,
     populate_calculated_return_rate,
     populate_derived_return_rate,
@@ -24,10 +26,40 @@ from erp_excel_sync import (
 )
 
 
+class LauncherFileTests(unittest.TestCase):
+    def test_only_new_platform_launcher_names_are_present(self):
+        project_dir = Path(__file__).resolve().parents[1]
+
+        self.assertTrue((project_dir / "一键同步mac.command").is_file())
+        self.assertTrue((project_dir / "一键同步win.bat").is_file())
+        self.assertFalse((project_dir / "查看ERP.command").exists())
+        self.assertFalse((project_dir / "查看ERPwin.bat").exists())
+        self.assertFalse((project_dir / "view_erp.py").exists())
+        self.assertFalse((project_dir / "一键同步.command").exists())
+        self.assertFalse((project_dir / "run_sync.bat").exists())
+
+    def test_windows_launcher_prefers_bundled_runtime_with_system_fallbacks(self):
+        launcher = Path(__file__).resolve().parents[1] / "一键同步win.bat"
+        contents = launcher.read_text(encoding="utf-8")
+
+        self.assertIn('if exist "%~dp0runtime\\python.exe"', contents)
+        self.assertIn("python -c", contents)
+        self.assertIn("py -3 -c", contents)
+        self.assertIn('"%PYTHON_EXE%" %PYTHON_ARGS%', contents)
+        self.assertIn('"%~dp0erp_excel_sync.py" --config "%~dp0config.json"', contents)
+        self.assertIn('if "%SYNC_EXIT_CODE%"=="2"', contents)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX executable bit is required")
+    def test_macos_launcher_is_executable(self):
+        launcher = Path(__file__).resolve().parents[1] / "一键同步mac.command"
+
+        self.assertTrue(os.access(launcher, os.X_OK))
+
+
 @unittest.skipUnless(shutil.which("cmd.exe"), "Windows cmd.exe is required")
 class LauncherTests(unittest.TestCase):
     def test_batch_launcher_passes_script_and_config_to_python(self):
-        launcher = Path(__file__).resolve().parents[1] / "run_sync.bat"
+        launcher = Path(__file__).resolve().parents[1] / "一键同步win.bat"
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             capture_path = temp_path / "args.txt"
@@ -159,6 +191,65 @@ class DateWindowTests(unittest.TestCase):
         self.assertNotIn("5", payload["asTypes"].split(","))
         self.assertNotIn("4", payload["asTypes"].split(","))
 
+
+class BrowserLoginRecoveryTests(unittest.TestCase):
+    @mock.patch("erp_excel_sync.time_module.monotonic")
+    @mock.patch("erp_excel_sync.time_module.sleep")
+    def test_default_login_wait_has_no_timeout_and_resumes_after_login(
+        self, sleep_mock, monotonic_mock
+    ):
+        session = mock.Mock()
+        session.post_form_json.side_effect = [
+            BrowserLoginRequired("expired"),
+            {"result": 1, "data": {"list": []}},
+        ]
+        monotonic_mock.side_effect = AssertionError(
+            "default login recovery must not create or check a deadline"
+        )
+
+        result = fetch_api_via_chrome(
+            session,
+            "111873",
+            "2026-08-01",
+            "2026-08-31",
+        )
+
+        self.assertEqual(result["syncMeta"]["count"], 0)
+        self.assertEqual(session.post_form_json.call_count, 2)
+        session.show_login_window.assert_called_once_with()
+        sleep_mock.assert_called_once_with(2)
+
+    @mock.patch("erp_excel_sync.time_module.sleep")
+    def test_chinese_missing_session_message_waits_for_login(self, sleep_mock):
+        session = mock.Mock()
+        session.post_form_json.side_effect = [
+            {"result": 0, "message": "刷新的会话信息不存在"},
+            {"result": 1, "data": {"list": []}},
+        ]
+
+        result = fetch_api_via_chrome(
+            session,
+            "111873",
+            "2026-08-01",
+            "2026-08-31",
+        )
+
+        self.assertEqual(result["syncMeta"]["count"], 0)
+        session.show_login_window.assert_called_once_with()
+        sleep_mock.assert_called_once_with(2)
+
+    def test_explicit_login_timeout_is_still_available_for_diagnostics(self):
+        session = mock.Mock()
+        session.post_form_json.side_effect = BrowserLoginRequired("expired")
+
+        with self.assertRaisesRegex(RuntimeError, "Timed out waiting"):
+            fetch_api_via_chrome(
+                session,
+                "111873",
+                "2026-08-01",
+                "2026-08-31",
+                login_timeout=0,
+            )
 
 class MonthlyOrchestrationTests(unittest.TestCase):
     def _args(self, root: Path) -> SimpleNamespace:
@@ -472,6 +563,13 @@ class XmlWriteTests(unittest.TestCase):
             b'<c r="Y5" s="141"><v>153</v></c><c r="AA5" s="219">',
             patched,
         )
+
+    def test_reuses_default_style_for_an_existing_styleless_cell(self):
+        row = b'<row r="5"><c r="Y5"/><c r="AA5" s="219"><v>0.1</v></c></row>'
+
+        patched = set_cell_value(row, "Y", 5, 153, default_style="141")
+
+        self.assertIn(b'<c r="Y5" s="141"><v>153</v></c>', patched)
 
     def test_writes_alias_rows_and_leaves_unapproved_fuzzy_rows_for_review(self):
         sheet_xml = (

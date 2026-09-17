@@ -8,23 +8,98 @@ from pathlib import Path
 import socket
 import struct
 import subprocess
+import sys
 import time
+from collections.abc import Mapping
 from typing import Any
 from urllib.error import URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 
-CHROME_EXECUTABLE = Path(
+MACOS_CHROME_EXECUTABLE = Path(
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 )
-ERP_HOME = "https://erp.superboss.cc/index.html"
+ERP_HOME = "https://erpa.superboss.cc/index.html"
+ERP_ORIGINS = (
+    "https://erpa.superboss.cc",
+    "https://erp.superboss.cc",
+)
 DEBUG_PORT = 9229
 WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+RETRYABLE_CDP_NAVIGATION_ERRORS = (
+    "inspected target navigated or closed",
+    "execution context was destroyed",
+    "cannot find context with specified id",
+    "no target with given id found",
+)
 
 
 class BrowserLoginRequired(RuntimeError):
     pass
+
+
+def _chrome_executable_candidates(
+    platform_name: str | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> tuple[Path, ...]:
+    platform_name = platform_name or sys.platform
+    environment = os.environ if environ is None else environ
+    if platform_name == "darwin":
+        return (MACOS_CHROME_EXECUTABLE,)
+    if platform_name == "win32":
+        candidates: list[Path] = []
+        for variable in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+            root = environment.get(variable)
+            if root:
+                candidates.append(
+                    Path(root) / "Google" / "Chrome" / "Application" / "chrome.exe"
+                )
+        return tuple(candidates)
+    raise RuntimeError(
+        f"Unsupported operating system for Chrome ERP login: {platform_name}"
+    )
+
+
+def _find_chrome_executable(
+    platform_name: str | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> Path:
+    platform_name = platform_name or sys.platform
+    candidates = _chrome_executable_candidates(platform_name, environ)
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    system_label = "macOS" if platform_name == "darwin" else "Windows"
+    searched = ", ".join(str(path) for path in candidates) or "no install paths"
+    raise RuntimeError(
+        f"Google Chrome was not found on {system_label}. Searched: {searched}"
+    )
+
+
+def _chrome_profile_path(
+    platform_name: str | None = None,
+    environ: Mapping[str, str] | None = None,
+    home: Path | None = None,
+) -> Path:
+    platform_name = platform_name or sys.platform
+    environment = os.environ if environ is None else environ
+    home = Path.home() if home is None else Path(home)
+    if platform_name == "darwin":
+        return (
+            home
+            / "Library"
+            / "Application Support"
+            / "ERP Excel Sync"
+            / "ChromeProfile"
+        )
+    if platform_name == "win32":
+        local_app_data = environment.get("LOCALAPPDATA")
+        base = Path(local_app_data) if local_app_data else home / "AppData" / "Local"
+        return base / "ERP Excel Sync" / "ChromeProfile"
+    raise RuntimeError(
+        f"Unsupported operating system for Chrome ERP login: {platform_name}"
+    )
 
 
 def _read_exact(connection: socket.socket, size: int) -> bytes:
@@ -211,6 +286,27 @@ def _close_extra_page_targets(
             pass
 
 
+def _erp_page_target(targets: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for origin in ERP_ORIGINS:
+        target = next(
+            (
+                item
+                for item in targets
+                if item.get("type") == "page"
+                and item.get("url", "").startswith(origin + "/")
+            ),
+            None,
+        )
+        if target is not None:
+            return target
+    return None
+
+
+def _is_retryable_navigation_error(error: RuntimeError) -> bool:
+    message = str(error).casefold()
+    return any(marker in message for marker in RETRYABLE_CDP_NAVIGATION_ERRORS)
+
+
 class ChromeErpSession:
     def __init__(self) -> None:
         self._client: _CdpWebSocket | None = None
@@ -221,19 +317,12 @@ class ChromeErpSession:
         try:
             _debug_json("/json/version")
         except (OSError, URLError, ValueError):
-            if not CHROME_EXECUTABLE.exists():
-                raise RuntimeError("Google Chrome is not installed")
-            profile = (
-                Path.home()
-                / "Library"
-                / "Application Support"
-                / "ERP Excel Sync"
-                / "ChromeProfile"
-            )
+            chrome_executable = _find_chrome_executable()
+            profile = _chrome_profile_path()
             _enable_session_restore(profile)
             subprocess.Popen(
                 [
-                    str(CHROME_EXECUTABLE),
+                    str(chrome_executable),
                     f"--remote-debugging-port={DEBUG_PORT}",
                     f"--user-data-dir={profile}",
                     "--remote-allow-origins=*",
@@ -259,15 +348,7 @@ class ChromeErpSession:
         if not targets:
             raise RuntimeError("Chrome did not start its ERP login window")
 
-        target = next(
-            (
-                item
-                for item in targets
-                if item.get("type") == "page"
-                and item.get("url", "").startswith("https://erp.superboss.cc/")
-            ),
-            None,
-        )
+        target = _erp_page_target(targets)
         if target is None:
             target = _debug_json(
                 "/json/new?" + ERP_HOME,
@@ -279,8 +360,7 @@ class ChromeErpSession:
         websocket_url = target.get("webSocketDebuggerUrl")
         if not websocket_url:
             raise RuntimeError("Chrome ERP tab has no debugger connection")
-        self._client = _CdpWebSocket(websocket_url)
-        self._client.call("Runtime.enable")
+        self._replace_client(websocket_url)
         page_deadline = time.monotonic() + 30
         while time.monotonic() < page_deadline:
             location = self._client.call(
@@ -290,10 +370,7 @@ class ChromeErpSession:
                     "returnByValue": True,
                 },
             )
-            if (
-                location.get("result", {}).get("value")
-                == "https://erp.superboss.cc"
-            ):
+            if location.get("result", {}).get("value") in ERP_ORIGINS:
                 break
             time.sleep(0.25)
         else:
@@ -301,9 +378,48 @@ class ChromeErpSession:
         self._client.call("Page.bringToFront")
         return self
 
+    def _replace_client(self, websocket_url: str) -> None:
+        replacement = _CdpWebSocket(websocket_url)
+        try:
+            replacement.call("Runtime.enable")
+        except BaseException:
+            replacement.close()
+            raise
+        previous = self._client
+        self._client = replacement
+        if previous is not None:
+            previous.close()
+
+    def _reconnect_after_navigation(self) -> None:
+        targets = _debug_json("/json/list")
+        target = _erp_page_target(targets)
+        if target is None:
+            target = _debug_json(
+                "/json/new?" + ERP_HOME,
+                method="PUT",
+            )
+        websocket_url = target.get("webSocketDebuggerUrl")
+        if not websocket_url:
+            raise RuntimeError("Chrome ERP tab has no debugger connection")
+        self._replace_client(websocket_url)
+
     def keep_open(self) -> None:
         """Detach after use without closing the dedicated ERP browser."""
         self._keep_open = True
+
+    def show_login_window(self) -> None:
+        if self._client is None:
+            raise RuntimeError("Chrome ERP session is not connected")
+        try:
+            self._client.call("Page.navigate", {"url": ERP_HOME})
+            self._client.call("Page.bringToFront")
+        except RuntimeError as exc:
+            if not _is_retryable_navigation_error(exc):
+                raise
+            self._reconnect_after_navigation()
+            assert self._client is not None
+            self._client.call("Page.navigate", {"url": ERP_HOME})
+            self._client.call("Page.bringToFront")
 
     def post_form_json(
         self,
@@ -334,14 +450,27 @@ class ChromeErpSession:
           }}
         }})()
         """
-        result = self._client.call(
-            "Runtime.evaluate",
-            {
-                "expression": expression,
-                "awaitPromise": True,
-                "returnByValue": True,
-            },
-        )
+        try:
+            result = self._client.call(
+                "Runtime.evaluate",
+                {
+                    "expression": expression,
+                    "awaitPromise": True,
+                    "returnByValue": True,
+                },
+            )
+        except RuntimeError as exc:
+            if not _is_retryable_navigation_error(exc):
+                raise
+            try:
+                self._reconnect_after_navigation()
+            except (OSError, URLError, ValueError, RuntimeError):
+                # The login redirect may still be replacing its target. The
+                # caller's existing login wait loop will retry after a pause.
+                pass
+            raise BrowserLoginRequired(
+                "ERP page navigated while the ERP request was running"
+            ) from exc
         if "exceptionDetails" in result:
             raise RuntimeError("Chrome could not execute the ERP request")
         value = result.get("result", {}).get("value")

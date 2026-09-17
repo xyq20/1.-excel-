@@ -147,8 +147,17 @@ def discover_layout(
             raise ValueError(f"expected exactly one {label} header, found {len(matches)}")
         return matches[0]
 
-    peer_col, peer_row = unique_header("同期销量", lambda text: text == "同期销量")
     change_col, change_row = unique_header("变化情况", lambda text: text == "变化情况")
+    peer_matches = [
+        (col, row)
+        for col, row, text in cells
+        if text == "同期销量"
+        and row == change_row
+        and column_number(col) < column_number(change_col)
+    ]
+    if not peer_matches:
+        raise ValueError("expected at least one 同期销量 header before 变化情况, found 0")
+    peer_col, peer_row = max(peer_matches, key=lambda item: column_number(item[0]))
     before_return_col, before_return_row = unique_header(
         "发货前退货率",
         lambda text: text == "发货前退货率" or text.startswith("发货前退货率("),
@@ -161,13 +170,7 @@ def discover_layout(
         "退货率",
         lambda text: text == "退货率" or text.startswith("退货率("),
     )
-    if len({
-        peer_row,
-        change_row,
-        before_return_row,
-        after_return_row,
-        return_row,
-    }) != 1:
+    if len({peer_row, change_row, before_return_row, after_return_row, return_row}) != 1:
         raise ValueError("core headers are not on the same row")
     header_row = peer_row
 
@@ -622,6 +625,8 @@ def _set_cell_formula(
     row_number: int,
     formula: str,
     default_style: str | None = None,
+    *,
+    force_style: bool = False,
 ) -> bytes:
     existing = next(
         (cell for cell in CELL_RE.finditer(row) if _cell_col(cell) == col),
@@ -634,6 +639,8 @@ def _set_cell_formula(
         opening = existing.group(0).split(b">", 1)[0].rstrip(b"/")
         opening = re.sub(rb'\s+t="[^"]*"', b"", opening)
         opening = re.sub(rb'\s+vm="[^"]*"', b"", opening)
+        if force_style or not re.search(rb'\s+s="[^"]*"', opening):
+            opening = _apply_cell_style(opening, default_style)
     encoded = html.escape(formula, quote=False).encode("utf-8")
     cell = opening + b"><f>" + encoded + b"</f></c>"
     return _insert_or_replace_cell(row, col, row_number, cell)
@@ -667,6 +674,38 @@ def _column_style(sheet_xml: bytes, col: str) -> str | None:
         return None
     style, count = Counter(styles).most_common(1)[0]
     return style if count > len(styles) / 2 else None
+
+
+def _first_column_style(
+    sheet_xml: bytes,
+    col: str,
+    *,
+    after_row: int = 0,
+) -> str | None:
+    for cell in CELL_RE.finditer(sheet_xml):
+        if _cell_col(cell) != col or _cell_row(cell) <= after_row:
+            continue
+        style = re.search(rb'\bs="(\d+)"', cell.group(0).split(b">", 1)[0])
+        if style:
+            return style.group(1).decode("ascii")
+    return None
+
+
+def _column_default_style(sheet_xml: bytes, col: str) -> str | None:
+    """Return the worksheet column style that applies to ``col``."""
+    cols_match = re.search(rb'<cols\b[^>]*>(?P<body>.*?)</cols>', sheet_xml, re.S)
+    if cols_match is None:
+        return None
+    target = column_number(col)
+    for tag in re.findall(rb'<col\b[^>]*/>', cols_match.group("body")):
+        attrs = _tag_attributes(tag)
+        try:
+            start, end = int(attrs["min"]), int(attrs["max"])
+        except (KeyError, ValueError):
+            continue
+        if start <= target <= end:
+            return attrs.get("style")
+    return None
 
 
 def _extend_change_conditional_formatting(
@@ -812,14 +851,34 @@ def apply_monthly_values(
     row_matches: dict[str, list[dict[str, Any]]] = {}
     formula_count = 0
     formula_rows: set[int] = set()
-    peer_formula_style = _formula_column_style(
+    existing_peer_formula_style = _formula_column_style(
         insertion.sheet_xml, layout.peer_col
+    )
+    previous_number = column_number(layout.previous_col)
+    older_month_cols = [
+        col for col in layout.month_cols if column_number(col) < previous_number
+    ]
+    peer_style_source_col = (
+        older_month_cols[-1] if older_month_cols else layout.previous_col
+    )
+    peer_formula_style = (
+        existing_peer_formula_style
+        or _first_column_style(
+            insertion.sheet_xml,
+            peer_style_source_col,
+            after_row=layout.header_row,
+        )
+        or _column_default_style(insertion.sheet_xml, peer_style_source_col)
     )
     change_formula_style = _formula_column_style(
         insertion.sheet_xml, layout.change_col
     )
     dominant_return_percentage_style = _column_style(
         insertion.sheet_xml, layout.return_col
+    )
+    actual_number_style = (
+        _column_default_style(insertion.sheet_xml, layout.actual_col)
+        or _column_style(insertion.sheet_xml, layout.actual_col)
     )
 
     def update_row(match: re.Match[bytes]) -> bytes:
@@ -918,7 +977,16 @@ def apply_monthly_values(
                 actual_status = "invalid_actual"
             else:
                 actual_auto_write = True
-                row = _set_cell_number(row, layout.actual_col, row_number, new_actual)
+                row = _set_cell_number(
+                    row,
+                    layout.actual_col,
+                    row_number,
+                    new_actual,
+                    style=(
+                        _cell_style(row, layout.actual_col)
+                        or actual_number_style
+                    ),
+                )
                 if new_actual != old_actual:
                     changed.append("actual")
         if not actual_auto_write:
@@ -1040,12 +1108,18 @@ def apply_monthly_values(
             row_number,
             peer_formula(layout.previous_col, row_number, cycle),
             default_style=peer_formula_style,
+            force_style=existing_peer_formula_style is None,
         )
         row = _set_cell_formula(
             row,
             layout.change_col,
             row_number,
-            change_formula(layout.actual_col, layout.peer_col, row_number, cycle),
+            change_formula(
+                layout.actual_col,
+                layout.previous_col if cycle.kind == "first" else layout.peer_col,
+                row_number,
+                cycle,
+            ),
             default_style=change_formula_style,
         )
         formula_count += 2
@@ -1098,6 +1172,7 @@ def apply_monthly_values(
         return row
 
     patched = ROW_RE.sub(update_row, insertion.sheet_xml)
+    patched = _apply_cycle_column_visibility(patched, layout, cycle)
     patched = _extend_change_conditional_formatting(
         patched, layout.change_col, formula_rows
     )
@@ -1183,6 +1258,23 @@ def _cell_formula(row: bytes, col: str) -> str | None:
     return html.unescape(formula.group(1).decode("utf-8", "ignore")).strip()
 
 
+def _column_is_hidden(sheet_xml: bytes, col: str) -> bool:
+    cols_match = re.search(rb'<cols\b[^>]*>(?P<body>.*?)</cols>', sheet_xml, re.S)
+    if cols_match is None:
+        return False
+    target = column_number(col)
+    hidden = False
+    for tag in re.findall(rb'<col\b[^>]*/>', cols_match.group("body")):
+        attrs = _tag_attributes(tag)
+        try:
+            start, end = int(attrs["min"]), int(attrs["max"])
+        except (KeyError, ValueError):
+            continue
+        if start <= target <= end:
+            hidden = attrs.get("hidden", "0").casefold() in {"1", "true"}
+    return hidden
+
+
 def validate_monthly_sheet(
     sheet_xml: bytes,
     shared_strings: list[str],
@@ -1236,6 +1328,15 @@ def validate_monthly_sheet(
             f"return header mismatch: found {found_return!r}, expected {expected_return!r}"
         )
 
+    peer_hidden = _column_is_hidden(sheet_xml, layout.peer_col)
+    expected_peer_hidden = cycle.kind == "first"
+    if peer_hidden != expected_peer_hidden:
+        state = "hidden" if peer_hidden else "visible"
+        expected_state = "hidden" if expected_peer_hidden else "visible"
+        raise RuntimeError(
+            f"peer column visibility mismatch: found {state}, expected {expected_state}"
+        )
+
     sku_rows: list[int] = []
     peer_count = 0
     change_count = 0
@@ -1257,7 +1358,10 @@ def validate_monthly_sheet(
         peer_count += 1
         found_change = _cell_formula(row, layout.change_col)
         expected_change = change_formula(
-            layout.actual_col, layout.peer_col, row_number, cycle
+            layout.actual_col,
+            layout.previous_col if cycle.kind == "first" else layout.peer_col,
+            row_number,
+            cycle,
         )
         if found_change != expected_change:
             raise RuntimeError(
@@ -1272,6 +1376,7 @@ def validate_monthly_sheet(
         "formula_sample_rows": sku_rows[:5],
         "peer_formula_count": peer_count,
         "change_formula_count": change_count,
+        "peer_column_hidden": peer_hidden,
         "actual_header": found_actual,
         "before_return_header": found_before_return,
         "after_return_header": found_after_return,
@@ -1332,6 +1437,84 @@ def _column_tag(start: int, end: int, attrs: dict[str, str]) -> bytes:
             continue
         pieces.append(f'{key}="{html.escape(value, quote=True)}"')
     return ("<col " + " ".join(pieces) + "/>").encode("utf-8")
+
+
+def _apply_cycle_column_visibility(
+    sheet_xml: bytes,
+    layout: WorkbookLayout,
+    cycle: SyncCycle,
+) -> bytes:
+    """Hide 同期销量 on the first node and show it on the fifteenth node."""
+    cols_match = re.search(rb'<cols\b[^>]*>(?P<body>.*?)</cols>', sheet_xml, re.S)
+    effective: list[dict[str, str] | None] = [None] * (MAX_EXCEL_COLUMN + 1)
+    max_defined = 0
+    if cols_match:
+        for tag in re.findall(rb'<col\b[^>]*/>', cols_match.group("body")):
+            attrs = _tag_attributes(tag)
+            try:
+                start, end = int(attrs["min"]), int(attrs["max"])
+            except (KeyError, ValueError):
+                continue
+            if not 1 <= start <= end <= MAX_EXCEL_COLUMN:
+                raise ValueError(f"invalid worksheet column span: {start}:{end}")
+            clean = {
+                key: value
+                for key, value in attrs.items()
+                if key not in {"min", "max"}
+            }
+            for number in range(start, end + 1):
+                effective[number] = clean.copy()
+            max_defined = max(max_defined, end)
+
+    peer_number = column_number(layout.peer_col)
+    visible_numbers = {
+        column_number(layout.previous_col),
+        column_number(layout.actual_col),
+        column_number(layout.change_col),
+        column_number(layout.before_return_col),
+        column_number(layout.after_return_col),
+        column_number(layout.return_col),
+    }
+    if cycle.kind == "first":
+        attrs = (effective[peer_number] or {}).copy()
+        attrs["hidden"] = "1"
+        effective[peer_number] = attrs
+    else:
+        visible_numbers.add(peer_number)
+
+    for number in visible_numbers:
+        attrs = effective[number]
+        if attrs is None:
+            continue
+        attrs = attrs.copy()
+        attrs.pop("hidden", None)
+        effective[number] = attrs or None
+
+    limit = max(max_defined, peer_number, max(visible_numbers))
+    tags: list[bytes] = []
+    number = 1
+    while number <= limit:
+        attrs = effective[number]
+        if attrs is None:
+            number += 1
+            continue
+        end = number
+        while end + 1 <= limit and effective[end + 1] == attrs:
+            end += 1
+        tags.append(_column_tag(number, end, attrs))
+        number = end + 1
+
+    replacement = b"<cols>" + b"".join(tags) + b"</cols>"
+    if cols_match:
+        return (
+            sheet_xml[: cols_match.start()]
+            + replacement
+            + sheet_xml[cols_match.end() :]
+        )
+    sheet_data = sheet_xml.find(b"<sheetData")
+    if sheet_data < 0:
+        raise ValueError("worksheet has no sheetData element")
+    return sheet_xml[:sheet_data] + replacement + sheet_xml[sheet_data:]
 
 
 def _rewrite_column_definitions(

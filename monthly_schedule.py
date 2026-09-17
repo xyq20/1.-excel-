@@ -76,12 +76,20 @@ def return_header(cycle: SyncCycle, prefix: str = "退货率") -> str:
 
 def peer_formula(previous_col: str, row: int, cycle: SyncCycle) -> str:
     days = month_end(cycle.previous_month).day
-    return f"{previous_col}{row}/{days}*14"
+    formula = f"{previous_col}{row}/{days}*14"
+    if cycle.kind == "fifteenth":
+        return f"ROUND({formula},0)"
+    return formula
 
 
-def change_formula(actual_col: str, peer_col: str, row: int, cycle: SyncCycle) -> str:
+def change_formula(
+    actual_col: str,
+    comparison_col: str,
+    row: int,
+    cycle: SyncCycle,
+) -> str:
     month = cycle.actual_month.month
     return (
-        f'TEXT({actual_col}{row}-{peer_col}{row},'
+        f'TEXT({actual_col}{row}-{comparison_col}{row},'
         f'"{month}月增加0件；{month}月减少0件；持平")'
     )

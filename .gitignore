@@ -8,6 +8,7 @@ node_modules/
 *.xlsx
 outputs/
 reports/
+snapshots/
 erp_dimensions*.json
 match_log.json
 

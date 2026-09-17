@@ -34,6 +34,8 @@ from erp_excel_sync import (
     choose_candidate,
     create_same_directory_temp,
     fast_patch_zip,
+    monthly_workbook_path,
+    resolve_monthly_workbook,
     validate_workbook,
 )
 
@@ -112,7 +114,7 @@ def write_test_xlsx(
         rows=(
             b'<row r="2"><c r="E2" t="inlineStr"><is><t>SKU-1</t></is></c>'
             b'<c r="F2" t="inlineStr"><is><t>Product</t></is></c>'
-            b'<c r="W2"><v>31</v></c><c r="X2"><f>W2/31*14</f></c>'
+            b'<c r="W2"><v>31</v></c><c r="X2"><f>ROUND(W2/31*14,0)</f></c>'
             b'<c r="Y2"><v>10</v></c><c r="Z2"><f>'
             + 'TEXT(Y2-X2,&quot;8月增加0件；8月减少0件；持平&quot;)'.encode()
             + b'</f></c>'
@@ -361,6 +363,110 @@ class AtomicWorkbookReplaceTests(unittest.TestCase):
         self.assertEqual(self.master.read_bytes(), b"validated-candidate")
         self.assertEqual([path for path in self.root.iterdir() if path.suffix == ".bak"], [backup])
 
+    def test_month_rollover_renames_master_and_keeps_only_new_named_backup(self):
+        source = self.root / "26年8月分级总表_API同步.xlsx"
+        target = self.root / "26年9月分级总表_API同步.xlsx"
+        source.write_bytes(b"august-master")
+        source.with_suffix(".xlsx.bak").write_bytes(b"older-backup")
+
+        result = atomic_replace_master(source, self.candidate, target=target)
+
+        self.assertEqual(result, target.with_suffix(".xlsx.bak"))
+        self.assertEqual(target.read_bytes(), b"validated-candidate")
+        self.assertEqual(result.read_bytes(), b"august-master")
+        self.assertFalse(source.exists())
+        self.assertFalse(source.with_suffix(".xlsx.bak").exists())
+
+    def test_month_rollover_failure_restores_source_name(self):
+        source = self.root / "26年8月分级总表_API同步.xlsx"
+        target = self.root / "26年9月分级总表_API同步.xlsx"
+        source.write_bytes(b"august-master")
+        calls = 0
+
+        def fail_candidate(source_path, destination_path):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise PermissionError("candidate is locked")
+            os.replace(source_path, destination_path)
+
+        with self.assertRaisesRegex(PermissionError, "candidate is locked"):
+            atomic_replace_master(
+                source,
+                self.candidate,
+                target=target,
+                replace=fail_candidate,
+            )
+
+        self.assertEqual(source.read_bytes(), b"august-master")
+        self.assertTrue(self.candidate.exists())
+        self.assertFalse(target.exists())
+        self.assertFalse(target.with_suffix(".xlsx.bak").exists())
+
+
+class MonthlyWorkbookNamingTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_uses_actual_month_for_two_digit_year_filename(self):
+        workbook = Path("outputs/26年8月分级总表_API同步.xlsx")
+
+        self.assertEqual(
+            monthly_workbook_path(workbook, date(2026, 9, 1)),
+            Path("outputs/26年9月分级总表_API同步.xlsx"),
+        )
+
+    def test_non_monthly_filename_remains_unchanged(self):
+        workbook = Path("outputs/master.xlsx")
+
+        self.assertEqual(monthly_workbook_path(workbook, date(2026, 9, 1)), workbook)
+
+    def test_resolves_latest_existing_month_not_after_target(self):
+        configured = self.root / "26年8月分级总表_API同步.xlsx"
+        september = self.root / "26年9月分级总表_API同步.xlsx"
+        october = self.root / "26年10月分级总表_API同步.xlsx"
+        september.write_bytes(b"september")
+        october.write_bytes(b"future")
+
+        source, target = resolve_monthly_workbook(configured, date(2026, 9, 1))
+
+        self.assertEqual(source, september)
+        self.assertEqual(target, september)
+
+    def test_resolves_previous_month_when_target_does_not_exist(self):
+        configured = self.root / "26年8月分级总表_API同步.xlsx"
+        september = self.root / "26年9月分级总表_API同步.xlsx"
+        september.write_bytes(b"september")
+
+        source, target = resolve_monthly_workbook(configured, date(2026, 10, 1))
+
+        self.assertEqual(source, september)
+        self.assertEqual(target, self.root / "26年10月分级总表_API同步.xlsx")
+
+    def test_legacy_api_template_resolves_plain_current_filename(self):
+        configured = self.root / "26年8月分级总表_API同步.xlsx"
+        september = self.root / "26年9月分级总表.xlsx"
+        september.write_bytes(b"september")
+
+        source, target = resolve_monthly_workbook(configured, date(2026, 9, 1))
+
+        self.assertEqual(source, september)
+        self.assertEqual(target, september)
+
+    def test_plain_current_filename_keeps_plain_style_next_month(self):
+        configured = self.root / "26年8月分级总表_API同步.xlsx"
+        september = self.root / "26年9月分级总表.xlsx"
+        september.write_bytes(b"september")
+
+        source, target = resolve_monthly_workbook(configured, date(2026, 10, 1))
+
+        self.assertEqual(source, september)
+        self.assertEqual(target, self.root / "26年10月分级总表.xlsx")
+
 
 class WorkbookValidationTests(unittest.TestCase):
     def setUp(self):
@@ -421,7 +527,11 @@ class WorkbookValidationTests(unittest.TestCase):
             validate_workbook(self.source, self.candidate, self.cycle)
 
     def test_rejects_peer_formula_that_does_not_match_discovered_columns(self):
-        self._patch_sheet(self._sheet().replace(b"W2/31*14", b"V2/31*14"))
+        self._patch_sheet(
+            self._sheet().replace(
+                b"ROUND(W2/31*14,0)", b"ROUND(V2/31*14,0)"
+            )
+        )
 
         with self.assertRaisesRegex(RuntimeError, "peer formula.*row 2"):
             validate_workbook(self.source, self.candidate, self.cycle)
@@ -532,15 +642,38 @@ class LayoutDiscoveryTests(unittest.TestCase):
         self.assertIsNone(layout.insert_before_col)
         self.assertEqual(layout.actual_col, "Y")
 
-    def test_ambiguous_core_headers_raise_value_error(self):
+    def test_unrelated_peer_header_after_core_columns_is_ignored(self):
         sheet = august_sheet().replace(
             b'</row>',
             b'<c r="AD1" t="inlineStr"><is><t>\xe5\x90\x8c\xe6\x9c\x9f\xe9\x94\x80\xe9\x87\x8f</t></is></c></row>',
             1,
         )
 
-        with self.assertRaisesRegex(ValueError, "同期销量"):
-            discover_layout(sheet, [], resolve_sync_cycle(date(2026, 9, 15)))
+        layout = discover_layout(sheet, [], resolve_sync_cycle(date(2026, 9, 15)))
+
+        self.assertEqual(layout.peer_col, "X")
+
+    def test_multiple_historical_peer_headers_selects_one_next_to_current_actual(self):
+        sheet = workbook_sheet(
+            [
+                ("W", "7月实发"),
+                ("X", "同期销量"),
+                ("Y", "8月实发"),
+                ("Z", "同期销量"),
+                ("AA", "9月实发（9.1-9.14）"),
+                ("AB", "变化情况"),
+                ("AC", "发货前退货率（8.1-8.31）"),
+                ("AD", "发货后退货率（8.1-8.31）"),
+                ("AE", "退货率（8.1-8.31）"),
+            ]
+        )
+
+        layout = discover_layout(sheet, [], resolve_sync_cycle(date(2026, 9, 15)))
+
+        self.assertEqual(layout.previous_col, "Y")
+        self.assertEqual(layout.peer_col, "Z")
+        self.assertEqual(layout.actual_col, "AA")
+        self.assertFalse(layout.needs_insert)
 
     def test_malformed_core_column_order_raises_value_error(self):
         sheet = workbook_sheet(
@@ -850,6 +983,43 @@ class MonthlyValueWriteTests(unittest.TestCase):
             after_return_rows=kwargs.get("after_return_rows"),
         )
 
+    def test_peer_formula_without_explicit_style_uses_older_actual_style(self):
+        source = workbook_sheet(
+            [
+                ("W", "7月实发"),
+                ("X", "8月实发"),
+                ("Y", "同期销量"),
+                ("Z", "9月实发（9.15）"),
+                ("AA", "变化情况"),
+                ("AB", "发货前退货率（8.1-8.31）"),
+                ("AC", "发货后退货率（8.1-8.31）"),
+                ("AD", "退货率（8.1-8.31）"),
+            ],
+            rows=(
+                b'<row r="2"><c r="E2" t="inlineStr"><is><t>SKU-1</t></is></c>'
+                b'<c r="F2" t="inlineStr"><is><t>Product</t></is></c>'
+                b'<c r="W2" s="139"><v>31</v></c>'
+                b'<c r="X2" s="177"><v>62</v></c>'
+                b'<c r="Y2"><f>ROUND(X2/31*14,0)</f></c>'
+                b'<c r="Z2" s="177"><v>40</v></c>'
+                b'<c r="AA2" s="142"><f>stale</f></c>'
+                b'<c r="AB2" s="219"/><c r="AC2" s="219"/>'
+                b'<c r="AD2" s="219"/></row>'
+            ),
+        )
+
+        result = self._apply(
+            source,
+            resolve_sync_cycle(date(2026, 9, 15)),
+            [],
+            [],
+        )
+
+        self.assertIn(
+            b'<c r="Y2" s="139"><f>ROUND(X2/31*14,0)</f></c>',
+            result.sheet_xml,
+        )
+
     def test_uses_independent_datasets_and_never_leaks_unused_conflicting_fields(self):
         cycle = resolve_sync_cycle(date(2026, 8, 15))
         actual_rows = [{
@@ -871,6 +1041,28 @@ class MonthlyValueWriteTests(unittest.TestCase):
             result.rows[0]["changed_fields"],
             ("actual", "before_return", "after_return", "return"),
         )
+
+    def test_missing_actual_cell_uses_the_actual_column_style(self):
+        cycle = resolve_sync_cycle(date(2026, 8, 15))
+        sheet = self._sheet().replace(
+            b'<cols><col min="1" max="50" width="12" style="4"/></cols>',
+            b'<cols><col min="1" max="24" width="12" style="4"/>'
+            b'<col min="25" max="25" width="16" style="141"/>'
+            b'<col min="26" max="50" width="12" style="4"/></cols>',
+        ).replace(b'<c r="Y2" s="177"><v>10</v></c>', b'<c r="Y2"/>')
+
+        result = self._apply(
+            sheet,
+            cycle,
+            [{
+                "itemOuterId": "A-1",
+                "title": "Alpha",
+                "actualSysConsignCount": 123,
+            }],
+            [],
+        )
+
+        self.assertIn(b'<c r="Y2" s="141"><v>123</v></c>', result.sheet_xml)
 
     def test_profiles_use_independent_rates_and_below_threshold_clears_only_its_column(self):
         cycle = resolve_sync_cycle(date(2026, 8, 15))
@@ -1223,8 +1415,14 @@ class MonthlyValueWriteTests(unittest.TestCase):
         result = self._apply(sheet, cycle, [], [])
 
         self.assertEqual(result.formula_count, 6)
-        self.assertIn(b'<c r="X2" s="141"><f>W2/29*14</f></c>', result.sheet_xml)
-        self.assertIn(b'<c r="X3" s="241"><f>W3/29*14</f></c>', result.sheet_xml)
+        self.assertIn(
+            b'<c r="X2" s="141"><f>ROUND(W2/29*14,0)</f></c>',
+            result.sheet_xml,
+        )
+        self.assertIn(
+            b'<c r="X3" s="241"><f>ROUND(W3/29*14,0)</f></c>',
+            result.sheet_xml,
+        )
         self.assertIn(
             'c r="Z2" s="142"><f>TEXT(Y2-X2,"3月增加0件；3月减少0件；持平")</f></c>'.encode(),
             result.sheet_xml,
@@ -1298,7 +1496,10 @@ class MonthlyValueWriteTests(unittest.TestCase):
         )
 
         self.assertIn(b'<c r="Z554" s="178"><f>TEXT(', first.sheet_xml)
-        self.assertIn(b'<c r="X555" s="139"><f>W555/31*14</f></c>', first.sheet_xml)
+        self.assertIn(
+            b'<c r="X555" s="139"><f>ROUND(W555/31*14,0)</f></c>',
+            first.sheet_xml,
+        )
         self.assertIn(b'<c r="Z555" s="178"><f>TEXT(', first.sheet_xml)
         contains_text_cf = re.search(
             rb'<conditionalFormatting sqref="([^"]+)"><cfRule type="containsText"',
@@ -1333,6 +1534,19 @@ class MonthlyValueWriteTests(unittest.TestCase):
         self.assertNotIn("8月实发（8.15）".encode(), result.sheet_xml)
         self.assertIn("退货率（7.15-8.15）".encode(), result.sheet_xml)
         self.assertEqual(result.layout.actual_col, "Y")
+        self.assertIn(
+            'TEXT(Y2-W2,"8月增加0件；8月减少0件；持平")'.encode(),
+            result.sheet_xml,
+        )
+        cols_xml = re.search(rb'<cols>.*?</cols>', result.sheet_xml, re.S).group(0)
+        peer_attrs = None
+        for tag in re.findall(rb'<col\b[^>]*/>', cols_xml):
+            attrs = dict(re.findall(rb'(\w+)="([^"]*)"', tag))
+            if int(attrs[b"min"]) <= 24 <= int(attrs[b"max"]):
+                peer_attrs = attrs
+                break
+        self.assertIsNotNone(peer_attrs)
+        self.assertEqual(peer_attrs.get(b"hidden"), b"1")
 
     def test_fifteenth_inserts_new_month_once_then_refreshes_idempotently(self):
         cycle = resolve_sync_cycle(date(2026, 9, 15))
@@ -1344,6 +1558,25 @@ class MonthlyValueWriteTests(unittest.TestCase):
         self.assertFalse(second.inserted)
         self.assertEqual(second.sheet_xml, first.sheet_xml)
         self.assertEqual(second.layout.actual_col, "Z")
+
+    def test_fifteenth_unhides_peer_column_after_first_node_hid_it(self):
+        first = self._apply(
+            self._sheet(), resolve_sync_cycle(date(2026, 9, 1)), [], []
+        )
+        fifteenth = self._apply(
+            first.sheet_xml, resolve_sync_cycle(date(2026, 9, 15)), [], []
+        )
+
+        peer_number = column_number(fifteenth.layout.peer_col)
+        cols_xml = re.search(rb'<cols>.*?</cols>', fifteenth.sheet_xml, re.S).group(0)
+        peer_attrs = None
+        for tag in re.findall(rb'<col\b[^>]*/>', cols_xml):
+            attrs = dict(re.findall(rb'(\w+)="([^"]*)"', tag))
+            if int(attrs[b"min"]) <= peer_number <= int(attrs[b"max"]):
+                peer_attrs = attrs
+                break
+        self.assertIsNotNone(peer_attrs)
+        self.assertNotEqual(peer_attrs.get(b"hidden"), b"1")
 
 
 class WorkbookAndDrawingTests(unittest.TestCase):
