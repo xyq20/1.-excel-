@@ -24,6 +24,7 @@ ERP_HOME = "https://erpa.superboss.cc/index.html"
 ERP_ORIGINS = (
     "https://erpa.superboss.cc",
     "https://erp.superboss.cc",
+    "https://viperp.superboss.cc",
 )
 DEBUG_PORT = 9229
 WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -432,7 +433,11 @@ class ChromeErpSession:
         expression = f"""
         (async () => {{
           try {{
-            const response = await fetch({json.dumps(url)}, {{
+            const requestUrl = new URL({json.dumps(url)}, location.href);
+            // Login redirects to viperp.superboss.cc; keep the API request same-origin.
+            requestUrl.protocol = location.protocol;
+            requestUrl.host = location.host;
+            const response = await fetch(requestUrl.href, {{
               method: 'POST',
               credentials: 'include',
               headers: {json.dumps(headers)},

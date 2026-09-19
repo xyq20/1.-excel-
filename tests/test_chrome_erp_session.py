@@ -127,6 +127,27 @@ class ChromeErpSessionTests(unittest.TestCase):
         self.assertIs(_erp_page_target([legacy, current]), current)
         self.assertIs(_erp_page_target([legacy]), legacy)
 
+    def test_post_form_json_rewrites_api_host_to_current_erp_page(self):
+        session = ChromeErpSession()
+        client = _FakeClient({
+            "result": {
+                "value": json.dumps({
+                    "status": 200,
+                    "url": "https://viperp.superboss.cc/report/sale/dimensions/list",
+                    "contentType": "application/json",
+                    "text": "{}",
+                })
+            }
+        })
+        session._client = client
+
+        session.post_form_json(
+            "https://erpa.superboss.cc/report/sale/dimensions/list", {}, ""
+        )
+
+        expression = client.calls[0][1]["expression"]
+        self.assertIn("requestUrl.host = location.host", expression)
+
     @mock.patch("chrome_erp_session._debug_json")
     def test_only_one_erp_page_is_kept(self, debug_json):
         targets = [

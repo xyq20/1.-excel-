@@ -1316,12 +1316,21 @@ def run_monthly_sync(args: argparse.Namespace, run_date: date | None = None) -> 
     elif browser_login:
         print("正在打开ERP专用Chrome登录窗口……", flush=True)
         with ChromeErpSession() as browser_session:
+            print(
+                f"正在查询 ERP 实发数量（{actual_start} 至 {actual_end}）……",
+                flush=True,
+            )
             actual_document = fetch_api_via_chrome(
                 browser_session,
                 args.company_id,
                 actual_start,
                 actual_end,
                 as_types=(),
+            )
+            print(f"实发数量查询完成：{len(api_rows(actual_document))} 条", flush=True)
+            print(
+                f"正在查询 ERP 发货前退货率（{return_start} 至 {return_end}）……",
+                flush=True,
             )
             before_return_document = fetch_api_via_chrome(
                 browser_session,
@@ -1330,6 +1339,14 @@ def run_monthly_sync(args: argparse.Namespace, run_date: date | None = None) -> 
                 return_end,
                 as_types=BEFORE_RETURN_PROFILE.as_types,
             )
+            print(
+                f"发货前退货率查询完成：{len(api_rows(before_return_document))} 条",
+                flush=True,
+            )
+            print(
+                f"正在查询 ERP 发货后退货率（{return_start} 至 {return_end}）……",
+                flush=True,
+            )
             after_return_document = fetch_api_via_chrome(
                 browser_session,
                 args.company_id,
@@ -1337,12 +1354,24 @@ def run_monthly_sync(args: argparse.Namespace, run_date: date | None = None) -> 
                 return_end,
                 as_types=AFTER_RETURN_PROFILE.as_types,
             )
+            print(
+                f"发货后退货率查询完成：{len(api_rows(after_return_document))} 条",
+                flush=True,
+            )
+            print(
+                f"正在查询 ERP 总退货率（{return_start} 至 {return_end}）……",
+                flush=True,
+            )
             overall_return_document = fetch_api_via_chrome(
                 browser_session,
                 args.company_id,
                 return_start,
                 return_end,
                 as_types=OVERALL_RETURN_PROFILE.as_types,
+            )
+            print(
+                f"总退货率查询完成：{len(api_rows(overall_return_document))} 条",
+                flush=True,
             )
     else:
         actual_document = _load_or_fetch_window(

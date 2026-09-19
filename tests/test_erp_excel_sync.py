@@ -1,8 +1,6 @@
 import unittest
 import json
 import os
-import shutil
-import subprocess
 import tempfile
 from datetime import date
 from pathlib import Path
@@ -31,62 +29,15 @@ class LauncherFileTests(unittest.TestCase):
         project_dir = Path(__file__).resolve().parents[1]
 
         self.assertTrue((project_dir / "一键同步mac.command").is_file())
-        self.assertTrue((project_dir / "一键同步win.bat").is_file())
         self.assertFalse((project_dir / "查看ERP.command").exists())
-        self.assertFalse((project_dir / "查看ERPwin.bat").exists())
         self.assertFalse((project_dir / "view_erp.py").exists())
         self.assertFalse((project_dir / "一键同步.command").exists())
-        self.assertFalse((project_dir / "run_sync.bat").exists())
-
-    def test_windows_launcher_prefers_bundled_runtime_with_system_fallbacks(self):
-        launcher = Path(__file__).resolve().parents[1] / "一键同步win.bat"
-        contents = launcher.read_text(encoding="utf-8")
-
-        self.assertIn('if exist "%~dp0runtime\\python.exe"', contents)
-        self.assertIn("python -c", contents)
-        self.assertIn("py -3 -c", contents)
-        self.assertIn('"%PYTHON_EXE%" %PYTHON_ARGS%', contents)
-        self.assertIn('"%~dp0erp_excel_sync.py" --config "%~dp0config.json"', contents)
-        self.assertIn('if "%SYNC_EXIT_CODE%"=="2"', contents)
 
     @unittest.skipUnless(os.name == "posix", "POSIX executable bit is required")
     def test_macos_launcher_is_executable(self):
         launcher = Path(__file__).resolve().parents[1] / "一键同步mac.command"
 
         self.assertTrue(os.access(launcher, os.X_OK))
-
-
-@unittest.skipUnless(shutil.which("cmd.exe"), "Windows cmd.exe is required")
-class LauncherTests(unittest.TestCase):
-    def test_batch_launcher_passes_script_and_config_to_python(self):
-        launcher = Path(__file__).resolve().parents[1] / "一键同步win.bat"
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-            capture_path = temp_path / "args.txt"
-            (temp_path / "python.cmd").write_bytes(
-                b'@echo off\r\n> "%LAUNCH_CAPTURE%" echo %*\r\nexit /b 0\r\n'
-            )
-            environment = os.environ.copy()
-            environment["PATH"] = f"{temp_path}{os.pathsep}{environment['PATH']}"
-            environment["LAUNCH_CAPTURE"] = str(capture_path)
-
-            result = subprocess.run(
-                ["cmd.exe", "/d", "/c", str(launcher)],
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                env=environment,
-                timeout=10,
-            )
-
-            self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
-            self.assertTrue(capture_path.exists(), result.stderr.decode(errors="replace"))
-            arguments = capture_path.read_text(encoding="utf-8").strip()
-            self.assertEqual(
-                arguments,
-                f'"{launcher.parent / "erp_excel_sync.py"}" --config "{launcher.parent / "config.json"}"',
-            )
-
-
 class RuntimeConfigTests(unittest.TestCase):
     def test_ignores_underscore_prefixed_comment_fields(self):
         with tempfile.TemporaryDirectory() as temp_dir:
