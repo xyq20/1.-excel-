@@ -870,8 +870,14 @@ def apply_monthly_values(
         )
         or _column_default_style(insertion.sheet_xml, peer_style_source_col)
     )
-    change_formula_style = _formula_column_style(
-        insertion.sheet_xml, layout.change_col
+    # Newly added rows may have a blank change cell with no explicit style.
+    # Prefer the style used by existing formulas, then fall back to the
+    # dominant populated style in the column so the formula does not revert
+    # to the workbook default font (typically a smaller 宋体 11).
+    change_formula_style = (
+        _formula_column_style(insertion.sheet_xml, layout.change_col)
+        or _column_style(insertion.sheet_xml, layout.change_col)
+        or _column_default_style(insertion.sheet_xml, layout.change_col)
     )
     dominant_return_percentage_style = _column_style(
         insertion.sheet_xml, layout.return_col

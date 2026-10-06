@@ -1524,6 +1524,34 @@ class MonthlyValueWriteTests(unittest.TestCase):
         self.assertEqual(set(coverage.values()), {1})
         self.assertEqual(second.sheet_xml, first.sheet_xml)
 
+    def test_change_formula_uses_populated_column_style_when_no_formula_style_exists(self):
+        source = workbook_sheet(
+            [
+                ("W", "7月实发"),
+                ("X", "同期销量"),
+                ("Y", "8月实发（8.15）"),
+                ("Z", "变化情况"),
+                ("AA", "发货前退货率（7.1-7.31）"),
+                ("AB", "发货后退货率（7.1-7.31）"),
+                ("AC", "退货率（7.1-7.31）"),
+            ],
+            rows=(
+                b'<row r="2"><c r="E2" t="inlineStr"><is><t>SKU-1</t></is></c>'
+                b'<c r="F2" t="inlineStr"><is><t>Product</t></is></c>'
+                b'<c r="W2"><v>31</v></c><c r="Y2"><v>10</v></c>'
+                b'<c r="Z2" s="178"><v>old</v></c>'
+                b'<c r="AA2"><v>0.1</v></c><c r="AB2" s="178"><v>0.2</v></c>'
+                b'<c r="AC2"><v>0.3</v></c></row>'
+                b'<row r="3"><c r="E3" t="inlineStr"><is><t>SKU-2</t></is></c>'
+                b'<c r="F3" t="inlineStr"><is><t>Product 2</t></is></c>'
+                b'<c r="W3"><v>31</v></c><c r="Y3"><v>12</v></c>'
+                b'<c r="Z3"/><c r="AA3"><v>0.1</v></c><c r="AC3"><v>0.3</v></c></row>'
+            ),
+        )
+        result = self._apply(source, resolve_sync_cycle(date(2026, 8, 15)), [], [])
+
+        self.assertIn(b'<c r="Z3" s="178"><f>TEXT(', result.sheet_xml)
+
     def test_first_node_renames_staged_headers_without_insertion(self):
         cycle = resolve_sync_cycle(date(2026, 9, 1))
 
