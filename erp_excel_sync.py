@@ -31,6 +31,7 @@ from xlsx_monthly import (
     shift_qualified_worksheet_formulas,
     update_workbook_xml,
     validate_monthly_sheet,
+    validate_sku_columns,
 )
 
 
@@ -1078,6 +1079,18 @@ def validate_workbook(
     }
 
 
+def validate_source_workbook_columns(workbook: Path) -> dict[str, Any]:
+    """Fail before ERP access when the workbook identity columns are misplaced."""
+    with zipfile.ZipFile(workbook, "r") as archive:
+        shared_strings = (
+            read_shared_strings(archive)
+            if "xl/sharedStrings.xml" in archive.namelist()
+            else []
+        )
+        sheet_xml = archive.read(WORKSHEET_PATH)
+    return validate_sku_columns(sheet_xml, shared_strings)
+
+
 def sync_workbook(
     source: Path,
     output: Path | None,
@@ -1281,6 +1294,10 @@ def run_monthly_sync(args: argparse.Namespace, run_date: date | None = None) -> 
             "Master workbook not found: "
             f"{workbook} (configured naming template: {configured_workbook})"
         )
+    try:
+        validate_source_workbook_columns(workbook)
+    except (OSError, KeyError, zipfile.BadZipFile, RuntimeError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
     before_return_json = getattr(args, "before_return_json", None)
     after_return_json = getattr(args, "after_return_json", None)
     offline_inputs = (

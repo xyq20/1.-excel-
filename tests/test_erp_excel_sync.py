@@ -225,10 +225,11 @@ class MonthlyOrchestrationTests(unittest.TestCase):
 
     @mock.patch("erp_excel_sync.atomic_replace_master")
     @mock.patch("erp_excel_sync.validate_workbook")
+    @mock.patch("erp_excel_sync.validate_source_workbook_columns")
     @mock.patch("erp_excel_sync.prepare_monthly_update")
     @mock.patch("erp_excel_sync.fetch_api")
     def test_fetches_independent_windows_and_writes_reports_before_blocking(
-        self, fetch_api_mock, prepare_mock, validate_mock, replace_mock
+        self, fetch_api_mock, prepare_mock, source_columns_mock, validate_mock, replace_mock
     ):
         with tempfile.TemporaryDirectory() as temp_dir, mock.patch.dict(
             os.environ, {"ERP_COOKIE": "cookie"}
@@ -279,10 +280,11 @@ class MonthlyOrchestrationTests(unittest.TestCase):
 
     @mock.patch("erp_excel_sync.atomic_replace_master")
     @mock.patch("erp_excel_sync.validate_workbook")
+    @mock.patch("erp_excel_sync.validate_source_workbook_columns")
     @mock.patch("erp_excel_sync.fast_patch_zip")
     @mock.patch("erp_excel_sync.prepare_monthly_update")
     def test_dry_run_never_creates_or_replaces_a_candidate(
-        self, prepare_mock, patch_mock, validate_mock, replace_mock
+        self, prepare_mock, patch_mock, source_columns_mock, validate_mock, replace_mock
     ):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

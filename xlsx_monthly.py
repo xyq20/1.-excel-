@@ -1247,6 +1247,82 @@ def _cell_value(row: bytes, col: str, shared_strings: list[str]) -> str:
     return _cell_text(cell, shared_strings) if cell is not None else ""
 
 
+def validate_sku_columns(
+    sheet_xml: bytes,
+    shared_strings: list[str],
+) -> dict[str, Any]:
+    """Validate the fixed E/F/G identity columns before ERP queries start."""
+    rows = list(ROW_RE.finditer(sheet_xml))
+    header = next((match.group(0) for match in rows if _cell_row(match) == 1), None)
+    if header is None:
+        raise ValueError("货号列校验失败：找不到第 1 行表头")
+
+    expected_headers = {"E": "货号", "F": "商品名称", "G": "供应商"}
+    header_errors = []
+    for col, expected in expected_headers.items():
+        actual = normalize_header(_cell_value(header, col, shared_strings))
+        if actual != expected:
+            header_errors.append(f"{col}列应为“{expected}”，实际为“{actual or '空'}”")
+    if header_errors:
+        raise ValueError("货号列校验失败：" + "；".join(header_errors))
+
+    def looks_like_sku(value: str) -> bool:
+        text = str(value or "").strip()
+        if not text:
+            return False
+        compact = re.sub(r"\s+", "", text)
+        # ERP货号通常包含数字、连字符或全英文代码；供应商名称通常是中文。
+        return bool(
+            re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/\-]*", compact)
+            or (re.search(r"\d", compact) and not re.fullmatch(r"\d+", compact))
+            or re.fullmatch(r"\d+", compact)
+        )
+
+    def looks_like_misplaced_sku(value: str) -> bool:
+        compact = re.sub(r"\s+", "", str(value or "").strip())
+        # Ignore pure numeric supplier names such as 1688; require a code-like
+        # separator or a mix of ASCII letters and digits.
+        return bool(
+            ("-" in compact or "/" in compact)
+            and re.search(r"[A-Za-z]", compact)
+            or (re.search(r"[A-Za-z]", compact) and re.search(r"\d", compact))
+        )
+
+    suspicious: list[dict[str, Any]] = []
+    checked_rows = 0
+    for match in rows:
+        row_number = _cell_row(match)
+        if row_number == 1:
+            continue
+        e_value = _cell_value(match.group(0), "E", shared_strings).strip()
+        g_value = _cell_value(match.group(0), "G", shared_strings).strip()
+        if not e_value and not g_value:
+            continue
+        checked_rows += 1
+        if looks_like_misplaced_sku(g_value) and not looks_like_sku(e_value):
+            suspicious.append({"row": row_number, "e": e_value, "g": g_value})
+
+    suspicious_rows = [item["row"] for item in suspicious]
+    suspicious_run = any(
+        all(row_number + offset in suspicious_rows for offset in (1, 2))
+        for row_number in suspicious_rows
+    )
+    # A single supplier name can legitimately contain a code-like value (for
+    # example, a supplier label with a hyphen). Require a contiguous block so
+    # that one unusual supplier does not stop a valid run.
+    if suspicious_run:
+        examples = "、".join(
+            f"第{item['row']}行(E={item['e'] or '空'}, G={item['g']})"
+            for item in suspicious[:8]
+        )
+        suffix = "" if len(suspicious) <= 8 else f"等共{len(suspicious)}行"
+        raise ValueError(
+            "货号列校验失败：发现疑似把货号放在 G 列、E 列放了供应商的行；"
+            f"{examples}{suffix}。请将 ERP 货号放到 E 列后再运行。"
+        )
+    return {"header_row": 1, "checked_rows": checked_rows}
+
+
 def _cell_formula(row: bytes, col: str) -> str | None:
     cell = next(
         (candidate for candidate in CELL_RE.finditer(row) if _cell_col(candidate) == col),

@@ -23,6 +23,7 @@ from xlsx_monthly import (
     shift_formula_references,
     shift_qualified_worksheet_formulas,
     update_workbook_xml,
+    validate_sku_columns,
 )
 from erp_excel_sync import (
     AFTER_RETURN_FIELD,
@@ -503,6 +504,45 @@ class WorkbookValidationTests(unittest.TestCase):
         self.assertEqual(summary["change_formula_count"], 1)
         self.assertEqual(summary["media_count"], 1)
         self.assertEqual(summary["layout"]["actual_col"], "Y")
+
+    def test_sku_column_validation_rejects_supplier_and_sku_swapped(self):
+        sheet = workbook_sheet(
+            [
+                ("E", "货号"),
+                ("F", "商品名称"),
+                ("G", "供应商"),
+            ],
+            rows=(
+                '<row r="2"><c r="E2" t="inlineStr"><is><t>玩工艺</t></is></c>'
+                '<c r="F2" t="inlineStr"><is><t>侵略者</t></is></c>'
+                '<c r="G2" t="inlineStr"><is><t>NGBL-2037</t></is></c></row>'
+                '<row r="3"><c r="E3" t="inlineStr"><is><t>荣耀皮革</t></is></c>'
+                '<c r="F3" t="inlineStr"><is><t>猛虎下山</t></is></c>'
+                '<c r="G3" t="inlineStr"><is><t>NGBL-2073</t></is></c></row>'
+                '<row r="4"><c r="E4" t="inlineStr"><is><t>强哥鞋厂</t></is></c>'
+                '<c r="F4" t="inlineStr"><is><t>野兽</t></is></c>'
+                '<c r="G4" t="inlineStr"><is><t>LJ-01</t></is></c></row>'
+            ).encode("utf-8"),
+        )
+
+        with self.assertRaisesRegex(ValueError, "第2行.*G=NGBL-2037"):
+            validate_sku_columns(sheet, [])
+
+    def test_sku_column_validation_accepts_expected_identity_columns(self):
+        sheet = workbook_sheet(
+            [
+                ("E", "货号"),
+                ("F", "商品名称"),
+                ("G", "供应商"),
+            ],
+            rows=(
+                '<row r="2"><c r="E2" t="inlineStr"><is><t>NGBL-2037</t></is></c>'
+                '<c r="F2" t="inlineStr"><is><t>侵略者</t></is></c>'
+                '<c r="G2" t="inlineStr"><is><t>玩工艺</t></is></c></row>'
+            ).encode("utf-8"),
+        )
+
+        self.assertEqual(validate_sku_columns(sheet, []) ["checked_rows"], 1)
 
     def test_rejects_wrong_normalized_actual_header(self):
         self._patch_sheet(
