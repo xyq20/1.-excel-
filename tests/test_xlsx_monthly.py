@@ -1,4 +1,5 @@
 import re
+import html
 import os
 import json
 from pathlib import Path
@@ -117,7 +118,7 @@ def write_test_xlsx(
             b'<c r="F2" t="inlineStr"><is><t>Product</t></is></c>'
             b'<c r="W2"><v>31</v></c><c r="X2"><f>ROUND(W2/31*14,0)</f></c>'
             b'<c r="Y2"><v>10</v></c><c r="Z2"><f>'
-            + 'TEXT(Y2-X2,&quot;8月增加0件；8月减少0件；持平&quot;)'.encode()
+            + html.escape('IF(Y2-X2=0,"持平","8月"&IF(Y2-X2>0,"增加","减少")&TEXT(ABS(Y2-X2),"0")&"件")', quote=False).encode()
             + b'</f></c>'
             b'<c r="AA2"><v>0.05</v></c><c r="AB2"/>'
             b'<c r="AC2"><v>0.1</v></c></row>'
@@ -577,7 +578,7 @@ class WorkbookValidationTests(unittest.TestCase):
             validate_workbook(self.source, self.candidate, self.cycle)
 
     def test_rejects_change_formula_that_does_not_match_discovered_columns(self):
-        self._patch_sheet(self._sheet().replace(b"TEXT(Y2-X2", b"TEXT(Y2-W2"))
+        self._patch_sheet(self._sheet().replace(b"IF(Y2-X2=0", b"IF(Y2-W2=0"))
 
         with self.assertRaisesRegex(RuntimeError, "change formula.*row 2"):
             validate_workbook(self.source, self.candidate, self.cycle)
@@ -1464,7 +1465,9 @@ class MonthlyValueWriteTests(unittest.TestCase):
             result.sheet_xml,
         )
         self.assertIn(
-            'c r="Z2" s="142"><f>TEXT(Y2-X2,"3月增加0件；3月减少0件；持平")</f></c>'.encode(),
+            b'c r="Z2" s="142"><f>'
+            + html.escape('IF(Y2-X2=0,"持平","3月"&IF(Y2-X2>0,"增加","减少")&TEXT(ABS(Y2-X2),"0")&"件")', quote=False).encode()
+            + b'</f></c>',
             result.sheet_xml,
         )
         self.assertNotRegex(result.sheet_xml, rb'<c r="(?:X|Z)[234]"[^>]*><f>.*?</f><v>')
@@ -1535,12 +1538,12 @@ class MonthlyValueWriteTests(unittest.TestCase):
             matcher=choose_candidate,
         )
 
-        self.assertIn(b'<c r="Z554" s="178"><f>TEXT(', first.sheet_xml)
+        self.assertIn(b'<c r="Z554" s="178"><f>IF(', first.sheet_xml)
         self.assertIn(
             b'<c r="X555" s="139"><f>ROUND(W555/31*14,0)</f></c>',
             first.sheet_xml,
         )
-        self.assertIn(b'<c r="Z555" s="178"><f>TEXT(', first.sheet_xml)
+        self.assertIn(b'<c r="Z555" s="178"><f>IF(', first.sheet_xml)
         contains_text_cf = re.search(
             rb'<conditionalFormatting sqref="([^"]+)"><cfRule type="containsText"',
             first.sheet_xml,
@@ -1590,7 +1593,7 @@ class MonthlyValueWriteTests(unittest.TestCase):
         )
         result = self._apply(source, resolve_sync_cycle(date(2026, 8, 15)), [], [])
 
-        self.assertIn(b'<c r="Z3" s="178"><f>TEXT(', result.sheet_xml)
+        self.assertIn(b'<c r="Z3" s="178"><f>IF(', result.sheet_xml)
 
     def test_first_node_renames_staged_headers_without_insertion(self):
         cycle = resolve_sync_cycle(date(2026, 9, 1))
@@ -1603,7 +1606,7 @@ class MonthlyValueWriteTests(unittest.TestCase):
         self.assertIn("退货率（7.15-8.15）".encode(), result.sheet_xml)
         self.assertEqual(result.layout.actual_col, "Y")
         self.assertIn(
-            'TEXT(Y2-W2,"8月增加0件；8月减少0件；持平")'.encode(),
+            html.escape('IF(Y2-W2=0,"持平","8月"&IF(Y2-W2>0,"增加","减少")&TEXT(ABS(Y2-W2),"0")&"件")', quote=False).encode(),
             result.sheet_xml,
         )
         cols_xml = re.search(rb'<cols>.*?</cols>', result.sheet_xml, re.S).group(0)

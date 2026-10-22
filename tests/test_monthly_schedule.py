@@ -118,12 +118,13 @@ class HeaderAndFormulaTests(unittest.TestCase):
 
         self.assertEqual(peer_formula("W", 9, cycle), "W9/31*14")
 
-    def test_current_month_change_formula_matches_approved_text_exactly(self):
+    def test_october_change_formula_keeps_month_outside_number_format(self):
         cycle = resolve_sync_cycle(date(2026, 10, 15))
 
         self.assertEqual(
             change_formula("AA", "Z", 9, cycle),
-            'TEXT(AA9-Z9,"10月增加0件；10月减少0件；持平")',
+            'IF(AA9-Z9=0,"持平","10月"&IF(AA9-Z9>0,"增加","减少")'
+            '&TEXT(ABS(AA9-Z9),"0")&"件")',
         )
 
     def test_first_node_change_formula_can_compare_actual_to_previous_actual(self):
@@ -131,8 +132,20 @@ class HeaderAndFormulaTests(unittest.TestCase):
 
         self.assertEqual(
             change_formula("Y", "W", 4, cycle),
-            'TEXT(Y4-W4,"8月增加0件；8月减少0件；持平")',
+            'IF(Y4-W4=0,"持平","8月"&IF(Y4-W4>0,"增加","减少")'
+            '&TEXT(ABS(Y4-W4),"0")&"件")',
         )
+
+    def test_change_formula_keeps_every_month_literal_in_both_cycles(self):
+        for month in range(1, 13):
+            for day in (1, 15):
+                with self.subTest(month=month, day=day):
+                    cycle = resolve_sync_cycle(date(2026, month, day))
+                    formula = change_formula("AB", "AA", 123, cycle)
+                    self.assertIn(f'"{cycle.actual_month.month}月"&', formula)
+                    self.assertIn('TEXT(ABS(AB123-AA123),"0")', formula)
+                    self.assertIn('IF(AB123-AA123=0,"持平",', formula)
+                    self.assertIn('IF(AB123-AA123>0,"增加","减少")', formula)
 
 
 if __name__ == "__main__":

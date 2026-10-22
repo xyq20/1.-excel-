@@ -89,7 +89,10 @@ def change_formula(
     cycle: SyncCycle,
 ) -> str:
     month = cycle.actual_month.month
+    difference = f"{actual_col}{row}-{comparison_col}{row}"
+    # Keep the month outside TEXT's number format: the 0 in October's
+    # "10月" would otherwise consume a digit from the sales difference.
     return (
-        f'TEXT({actual_col}{row}-{comparison_col}{row},'
-        f'"{month}月增加0件；{month}月减少0件；持平")'
+        f'IF({difference}=0,"持平","{month}月"&'
+        f'IF({difference}>0,"增加","减少")&TEXT(ABS({difference}),"0")&"件")'
     )
